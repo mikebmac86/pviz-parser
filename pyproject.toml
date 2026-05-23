@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pviz-parser"
-version = "0.1.2"
+version = "0.1.3"
 description = "Generate LLM-optimized dependency analysis bundles from your codebase"
 readme = "README.md"
 license = { text = "MIT" }
@@ -51,7 +51,16 @@ Repository = "https://github.com/mikebmac86/pviz-parser"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["pviz_parser"]
+include = [
+    "pviz_parser*",
+    "analyzer*",
+    "analyzer_store*",
+    "adapters*",
+    "core*",
+    "diagnostics*",
+    "i_o*",
+    "contracts*",
+]
 exclude = [
     "scene*",
     "ui*",
