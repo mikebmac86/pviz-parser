@@ -11,10 +11,11 @@ from __future__ import annotations
 
 from pviz_parser.cli import main
 from core.json_export import build_llm_bundle_headless
-
+from analyzer.config import AnalyzerCfg
 __all__ = [
     "main",
     "build_llm_bundle_headless",
+    "AnalyzerCfg",
 ]
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
