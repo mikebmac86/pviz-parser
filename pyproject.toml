@@ -1,0 +1,65 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "pviz-parser"
+version = "0.1.0"
+description = "Generate LLM-optimized dependency analysis bundles from your codebase"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Michael McClellan", email = "mikemc@pvizgenerator.com" }
+]
+keywords = [
+    "dependency analysis",
+    "codebase analysis",
+    "llm context",
+    "static analysis",
+    "dependency graph",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Quality Assurance",
+]
+requires-python = ">=3.10"
+dependencies = [
+    "tree-sitter-language-pack",
+]
+
+[project.optional-dependencies]
+dev = [
+    "build",
+    "twine",
+]
+
+[project.scripts]
+pviz = "pviz_cli:main"
+
+[project.urls]
+Homepage = "https://pvizgenerator.com"
+Repository = "https://github.com/mikebmac86/pviz-parser"
+"Bug Tracker" = "https://github.com/mikebmac86/pviz-parser/issues"
+
+[tool.setuptools.packages.find]
+where = ["."]
+exclude = [
+    "scene*",
+    "ui*",
+    "layout*",
+    "Legal*",
+    "dist*",
+    "build*",
+    "*.egg-info*",
+]
+
+[tool.setuptools.package-data]
+"*" = ["pviz.toml", "LICENSE"]

@@ -1,0 +1,32 @@
+# Binary parser artifacts — SaaS only
+tools/
+*.jar
+
+# Build / packaging
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+
+# PViz runtime artifacts
+.pviz/
+.pviz_store/
+
+# Environment
+.env
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+commercial_license.txt
+bsl_license.txt
