@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "pviz-parser"
-version = "0.1.0"
+version = "0.1.1"
 description = "Generate LLM-optimized dependency analysis bundles from your codebase"
 readme = "README.md"
 license = { text = "MIT" }
@@ -63,3 +63,6 @@ exclude = [
 
 [tool.setuptools.package-data]
 "*" = ["pviz.toml", "LICENSE"]
+
+[tool.setuptools]
+py-modules = ["pviz_cli"]

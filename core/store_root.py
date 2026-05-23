@@ -51,7 +51,7 @@ def _user_data_base() -> Path:
 
 def default_store_root() -> Path:
     """
-    Per-user writable store root for Program Visualizer artifacts.
+    Per-user writable store root for pviz-parser artifacts.
 
     New behavior:
       - Uses a per-user app-data base directory.

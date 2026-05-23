@@ -229,7 +229,7 @@ def _coerce_position(value: Any) -> Tuple[float, float]:
 
 
 def serialize_graph_to_json_dict(graph: GraphLike | Mapping[str, Any]) -> GraphJson:
-    # Common metadata: provenance + evaluation-only hint.
+    # Common metadata: provenance.
     meta: Dict[str, Any] = {
         "tool": "pviz-parser",
         "build": "0.1.0",

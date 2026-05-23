@@ -34,8 +34,7 @@ def _jar_path() -> str:
     jar = os.environ.get("PVIZ_JAVAPARSER_JAR")
     if jar and jar.strip():
         return jar.strip()
-    # Reasonable default (adjust to your repo/image)
-    return "/opt/pviz/pviz-javaparser-cli.jar"
+    return "pviz-javaparser-cli.jar"
 
 
 def _java_bin() -> str:
