@@ -78,14 +78,14 @@ Kotlin, Go, and Rust analysis requires compiled binary dependencies that are par
 
 ## CLI vs SaaS
 
-`pviz-parser` is the open source CLI. It runs locally, produces bundles you own, and supports Python, TypeScript, JavaScript, and Java out of the box.
+`pviz-parser` is the open source CLI. It runs locally, produces bundles you own, and supports Python, TypeScript, JavaScript, and partial resolution for Java out of the box.
 
 [pvizgenerator.com](https://pvizgenerator.com) is the hosted SaaS layer. It adds full Kotlin, Go, and Rust support, hosted bundle storage, bundle diffing across commits, and MCP delivery for direct LLM tool integration — without running anything locally.
 
 ## Requirements
 
 - Python 3.10+
-- No other system dependencies for Python/TS/JS/Java analysis
+- No other system dependencies for Python/TS/JS/partial-Java analysis
 
 ## License
 
