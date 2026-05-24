@@ -430,6 +430,14 @@ def build_nodefacts(
     #   seed_id is None -> use imports_all (richer tokens; includes external deps).
     # Seeded mode:
     #   use imports_internal (historical behavior).
+    #
+    # Important:
+    #   imports_all is intentionally retained in classic mode for broader
+    #   conceptual/crosstalk visibility. However, raw imports_all tokens must
+    #   not receive consumer-relative prefix fallback during normalization,
+    #   because absolute imports such as "logging", "typing", or "json" can
+    #   collide with local modules such as "flask.logging", "flask.typing",
+    #   or "flask.json".
     using_all_tokens = seed_id is None
 
     imports_map: Dict[str, Tuple[str, ...]] = {}
@@ -498,7 +506,12 @@ def build_nodefacts(
             out.append(s)
         return out
 
-    def _resolve_to_mid(tok: str, *, consumer_mid: Optional[str]) -> Optional[str]:
+    def _resolve_to_mid(
+        tok: str,
+        *,
+        consumer_mid: Optional[str],
+        allow_consumer_prefix: bool,
+    ) -> Optional[str]:
         # 1) already a mid
         if tok in mids_set:
             return tok
@@ -509,7 +522,19 @@ def build_nodefacts(
                 return cand
 
         # 3) consumer-aware prefixing
-        if consumer_mid:
+        #
+        # This is only safe for tokens that are already known to be
+        # internal/relative. Do not apply it to raw imports_all tokens in
+        # classic mode, because absolute imports like "logging", "typing",
+        # or "json" can collide with sibling modules such as:
+        #
+        #   flask.logging
+        #   flask.typing
+        #   flask.json
+        #
+        # The absence of "." in source syntax matters. A bare absolute import
+        # should not be interpreted as an implicit relative sibling import.
+        if allow_consumer_prefix and consumer_mid:
             parts = consumer_mid.split(".")
             for i in range(len(parts) - 1, 0, -1):
                 prefix = ".".join(parts[:i])
@@ -540,22 +565,43 @@ def build_nodefacts(
     remapped = 0
     ext_token_total = 0
     ext_token_samples: List[str] = []
+    consumer_prefix_disabled_total = 0
 
     for a_mid, outs in imports_map.items():
         keep: List[str] = []
         for t in outs or ():
             if not isinstance(t, str) or not t:
                 continue
-            t_mid = _resolve_to_mid(t, consumer_mid=a_mid)
+
+            # In classic mode, imports_map is sourced from imports_all.
+            # Those tokens include stdlib/third-party/absolute names, so they
+            # must not receive consumer-relative prefix fallback.
+            #
+            # In seeded/internal mode, imports_map is sourced from
+            # imports_internal, so consumer-prefix fallback remains available
+            # for legacy/internal token normalization.
+            allow_consumer_prefix = not using_all_tokens
+
+            t_mid = _resolve_to_mid(
+                t,
+                consumer_mid=a_mid,
+                allow_consumer_prefix=allow_consumer_prefix,
+            )
+
             if t_mid is None:
                 dropped += 1
                 ext_token_total += 1
+                if using_all_tokens:
+                    consumer_prefix_disabled_total += 1
                 if len(ext_token_samples) < 40:
                     ext_token_samples.append(t)
                 continue
+
             if t_mid != t:
                 remapped += 1
+
             keep.append(t_mid)
+
         imports_map_norm[a_mid] = tuple(sorted(set(keep)))
 
     for a_mid, outs in imports_map_runtime.items():
@@ -563,9 +609,18 @@ def build_nodefacts(
         for t in outs or ():
             if not isinstance(t, str) or not t:
                 continue
-            t_mid = _resolve_to_mid(t, consumer_mid=a_mid)
+
+            # Runtime imports are expected to already be internal-only, so
+            # consumer-prefix fallback remains enabled here.
+            t_mid = _resolve_to_mid(
+                t,
+                consumer_mid=a_mid,
+                allow_consumer_prefix=True,
+            )
+
             if t_mid is not None:
                 keep_rt.append(t_mid)
+
         imports_map_runtime_norm[a_mid] = tuple(sorted(set(keep_rt)))
 
     log_event(
@@ -576,6 +631,8 @@ def build_nodefacts(
         external_tokens=ext_token_total,
         external_samples=ext_token_samples[:20],
         runtime_mids=len(imports_map_runtime_norm),
+        consumer_prefix_disabled=using_all_tokens,
+        consumer_prefix_disabled_total=consumer_prefix_disabled_total,
     )
 
     imports_map = imports_map_norm
@@ -911,6 +968,7 @@ def build_nodefacts(
         "imports_token_source": ("imports_all" if using_all_tokens else "imports_internal"),
         "external_import_tokens": ext_token_total,
         "external_import_samples": ext_token_samples[:20],
+        "consumer_prefix_disabled_for_imports_all": using_all_tokens,
         # v1.8 structural metrics
         "scc_conceptual": summary_conceptual,
         "scc_runtime": summary_runtime,
@@ -925,7 +983,6 @@ def build_nodefacts(
     )
     log_event("NODEFACTS:build_return", nodes=len(nodes))
     return NodeFacts(schema=NODEFACTS_SCHEMA, meta=meta, nodes=nodes)
-
 
 def save_nodefacts(nf: NodeFacts, path: Path) -> None:
     """
