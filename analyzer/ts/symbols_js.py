@@ -15,7 +15,7 @@ class JSSymbols:
 
 
 def _node_text(source: bytes, node: Any) -> str:
-    return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+    return source[node.start_byte():node.end_byte()].decode("utf-8", errors="replace")
 
 
 def _ident_text(source: bytes, node: Optional[Any]) -> Optional[str]:
@@ -30,17 +30,28 @@ def _ident_text(source: bytes, node: Optional[Any]) -> Optional[str]:
     """
     if node is None:
         return None
-    if node.type in ("identifier", "type_identifier", "property_identifier", "namespace_identifier"):
+    if node.kind() in ("identifier", "type_identifier", "property_identifier", "namespace_identifier"):
         txt = _node_text(source, node).strip()
         return txt or None
     return None
 
 
+def _children(node: Any) -> List[Any]:
+    """
+    Return all children of a node.
+
+    tree-sitter-language-pack >= 1.x removed the .children property.
+    Children must be accessed via .child(i) and .child_count().
+    """
+    count = node.child_count()
+    return [node.child(i) for i in range(count)]
+
+
 def _count_desc(node: Any, t: str) -> int:
     if node is None:
         return 0
-    n = 1 if node.type == t else 0
-    for ch in getattr(node, "children", []) or []:
+    n = 1 if node.kind() == t else 0
+    for ch in _children(node):
         n += _count_desc(ch, t)
     return n
 
@@ -48,9 +59,9 @@ def _count_desc(node: Any, t: str) -> int:
 def _find_first_desc(node: Any, t: str) -> Optional[Any]:
     if node is None:
         return None
-    if node.type == t:
+    if node.kind() == t:
         return node
-    for ch in getattr(node, "children", []) or []:
+    for ch in _children(node):
         out = _find_first_desc(ch, t)
         if out is not None:
             return out
@@ -66,11 +77,11 @@ def _first_ident_in(node: Any, source: bytes) -> Optional[str]:
     nm = _ident_text(source, node)
     if nm:
         return nm
-    for ch in getattr(node, "children", []) or []:
+    for ch in _children(node):
         nm = _ident_text(source, ch)
         if nm:
             return nm
-    for ch in getattr(node, "children", []) or []:
+    for ch in _children(node):
         nm = _first_ident_in(ch, source)
         if nm:
             return nm
@@ -129,8 +140,8 @@ def _summarize_class(cls_node: Any, source: bytes) -> Dict[str, Any]:
 
 
 def extract_js_symbols(*, tree: Any, source: bytes) -> JSSymbols:
-    root = tree.root_node
-    top_level = list(root.children)
+    root = tree.root_node()
+    top_level = _children(root)
 
     functions: Set[str] = set()
     classes: Set[str] = set()
@@ -174,8 +185,8 @@ def extract_js_symbols(*, tree: Any, source: bytes) -> JSSymbols:
             add_export(nm, "export_class_default" if is_default else "export_class")
 
     def handle_var_decl(node: Any, *, is_exported: bool = False) -> None:
-        for ch in node.children:
-            if ch.type != "variable_declarator":
+        for ch in _children(node):
+            if ch.kind() != "variable_declarator":
                 continue
             name_node = ch.child_by_field_name("name")
             init_node = ch.child_by_field_name("value") or ch.child_by_field_name("initializer")
@@ -187,44 +198,44 @@ def extract_js_symbols(*, tree: Any, source: bytes) -> JSSymbols:
                     add_export(nm, "export_var")
 
             if nm and init_node is not None:
-                if init_node.type in ("arrow_function", "function", "function_expression"):
+                if init_node.kind() in ("arrow_function", "function", "function_expression"):
                     functions.add(nm)
                     if is_exported:
                         add_export(nm, "export_fn_assigned")
 
     def handle_export_statement(exp: Any) -> None:
         # Determine if this export_statement is a default export.
-        is_default = any(ch.type == "default" for ch in exp.children)
+        is_default = any(ch.kind() == "default" for ch in _children(exp))
         if is_default:
             add_export("default", "export_default")
 
         decl = exp.child_by_field_name("declaration")
         if decl is not None:
-            if decl.type == "function_declaration":
+            if decl.kind() == "function_declaration":
                 nm = _ident_text(source, decl.child_by_field_name("name"))
                 if nm:
                     functions.add(nm)
                     add_export(nm, "export_fn_default" if is_default else "export_fn")
 
-            elif decl.type == "class_declaration":
+            elif decl.kind() == "class_declaration":
                 _add_class_from_decl(decl, is_exported=True, is_default=is_default)
 
-            elif decl.type in ("lexical_declaration", "variable_declaration"):
+            elif decl.kind() in ("lexical_declaration", "variable_declaration"):
                 handle_var_decl(decl, is_exported=True)
 
-            elif decl.type == "interface_declaration":
+            elif decl.kind() == "interface_declaration":
                 nm = _ident_text(source, decl.child_by_field_name("name"))
                 if nm:
                     ts_interfaces.add(nm)
                     add_export(nm, "export_interface")
 
-            elif decl.type == "type_alias_declaration":
+            elif decl.kind() == "type_alias_declaration":
                 nm = _ident_text(source, decl.child_by_field_name("name"))
                 if nm:
                     ts_types.add(nm)
                     add_export(nm, "export_type")
 
-            elif decl.type == "enum_declaration":
+            elif decl.kind() == "enum_declaration":
                 nm = _ident_text(source, decl.child_by_field_name("name"))
                 if nm:
                     ts_enums.add(nm)
@@ -232,8 +243,8 @@ def extract_js_symbols(*, tree: Any, source: bytes) -> JSSymbols:
 
         clause = exp.child_by_field_name("clause") or exp.child_by_field_name("export_clause")
         if clause is not None:
-            for ch in clause.children:
-                if ch.type != "export_specifier":
+            for ch in _children(clause):
+                if ch.kind() != "export_specifier":
                     continue
                 name_node = ch.child_by_field_name("name")
                 alias_node = ch.child_by_field_name("alias")
@@ -242,14 +253,14 @@ def extract_js_symbols(*, tree: Any, source: bytes) -> JSSymbols:
                     add_export(nm, "export_clause")
 
         # export * (re-export star)
-        for ch in exp.children:
-            if ch.type == "*":
+        for ch in _children(exp):
+            if ch.kind() == "*":
                 add_export("*", "export_star")
                 break
 
     # Top-level scan
     for stmt in top_level:
-        t = stmt.type
+        t = stmt.kind()
 
         if t == "function_declaration":
             nm = _ident_text(source, stmt.child_by_field_name("name"))

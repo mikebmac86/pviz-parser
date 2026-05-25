@@ -14,7 +14,7 @@ except Exception:  # pragma: no cover
 
 
 def _node_text(source: bytes, node) -> str:
-    return source[node.start_byte:node.end_byte].decode("utf-8", errors="replace")
+    return source[node.start_byte():node.end_byte()].decode("utf-8", errors="replace")
 
 
 def _string_literal_value(source: bytes, node) -> Optional[str]:
@@ -38,9 +38,21 @@ def _string_literal_value(source: bytes, node) -> Optional[str]:
 
 def _loc(node) -> Optional[Tuple[int, int]]:
     try:
-        return (node.start_point[0], node.start_point[1])
+        pos = node.start_position()
+        return (pos[0], pos[1])
     except Exception:
         return None
+
+
+def _children(node) -> List:
+    """
+    Return all children of a node.
+
+    tree-sitter-language-pack >= 1.x removed the .children property.
+    Children must be accessed via .child(i) and .child_count().
+    """
+    count = node.child_count()
+    return [node.child(i) for i in range(count)]
 
 
 def _first_string_descendant(node):
@@ -54,12 +66,12 @@ def _first_string_descendant(node):
     rely on the grammar's source field to avoid capturing arbitrary string
     literals from large statement nodes.
     """
-    stack = list(getattr(node, "children", []) or [])
+    stack = _children(node)
     while stack:
         cur = stack.pop()
-        if cur.type == "string":
+        if cur.kind() == "string":
             return cur
-        stack.extend(getattr(cur, "children", []) or [])
+        stack.extend(_children(cur))
     return None
 
 
@@ -74,7 +86,7 @@ def _module_spec_from_source_field(source: bytes, n) -> Optional[str]:
     if src is None:
         return None
 
-    if src.type == "string":
+    if src.kind() == "string":
         return _string_literal_value(source, src)
 
     # Some grammar variants may wrap the source string. Search only inside the
@@ -118,7 +130,7 @@ def extract_imports(*, tree, source: bytes) -> List[RawImport]:
       - crosstalk evidence strings
     """
     out: List[RawImport] = []
-    root = tree.root_node
+    root = tree.root_node()
 
     def walk(n):
         # ESM import declarations.
@@ -126,7 +138,7 @@ def extract_imports(*, tree, source: bytes) -> List[RawImport]:
         # Strictly use the grammar source field. Do not fallback to arbitrary
         # descendant strings, because some statement nodes can contain unrelated
         # string literals.
-        if n.type in ("import_statement", "import_declaration"):
+        if n.kind() in ("import_statement", "import_declaration"):
             spec = _module_spec_from_source_field(source, n)
             if spec:
                 out.append(RawImport(spec=spec, kind="import", symbols=[], loc=_loc(n)))
@@ -135,7 +147,7 @@ def extract_imports(*, tree, source: bytes) -> List[RawImport]:
         #
         # Only export statements with an explicit source field are imports.
         # Plain `export const x = "..."` must not become a reexport import.
-        elif n.type in ("export_statement", "export_clause", "export_declaration"):
+        elif n.kind() in ("export_statement", "export_clause", "export_declaration"):
             spec = _module_spec_from_source_field(source, n)
             if spec:
                 out.append(RawImport(spec=spec, kind="reexport", symbols=[], loc=_loc(n)))
@@ -144,7 +156,7 @@ def extract_imports(*, tree, source: bytes) -> List[RawImport]:
         #
         # Here descendant-string scanning is allowed, but only inside the
         # arguments node.
-        elif n.type == "call_expression":
+        elif n.kind() == "call_expression":
             callee = n.child_by_field_name("function")
             args = n.child_by_field_name("arguments")
 
@@ -157,7 +169,7 @@ def extract_imports(*, tree, source: bytes) -> List[RawImport]:
                         kind = "require" if callee_txt == "require" else "dynamic_import"
                         out.append(RawImport(spec=spec, kind=kind, symbols=[], loc=_loc(n)))
 
-        for ch in getattr(n, "children", []) or []:
+        for ch in _children(n):
             walk(ch)
 
     walk(root)

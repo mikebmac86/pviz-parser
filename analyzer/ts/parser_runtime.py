@@ -88,4 +88,7 @@ class TSRuntime:
         else:
             raise TSRuntimeError(f"Unknown TS/JS extension for parser routing: {p}")
 
-        return parser.parse(source_bytes)
+        # tree-sitter-language-pack >= 1.x requires str, not bytes.
+        # Byte offsets (start_byte, end_byte) remain valid on the returned
+        # nodes, so callers can continue to slice source_bytes directly.
+        return parser.parse(source_bytes.decode("utf-8", errors="replace"))
