@@ -69,7 +69,7 @@ __all__ = [
 ]
 
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 
 # --- config ---
 from .config import AnalyzerCfg, load_config, load_config_search
