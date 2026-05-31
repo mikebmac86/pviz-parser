@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pviz-parser"
-version = "0.1.7"
+version = "0.1.8"
 description = "Generate LLM-optimized dependency analysis bundles from your codebase"
 readme = "README.md"
 license = { text = "MIT" }

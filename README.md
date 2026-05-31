@@ -66,13 +66,13 @@ A compressed format is also generated alongside the standard bundle (`.compresse
 
 | Language | CLI (this package) | SaaS ([pvizgenerator.com](https://pvizgenerator.com)) |
 |---|---|---|
-| Python | ✅ | ✅ |
-| TypeScript | ✅ | ✅ |
-| JavaScript | ✅ | ✅ |
-| Java | ✅ (partial — pure Python parser) | ✅ (full resolution) |
-| Kotlin | ❌ | ✅ |
-| Go | ❌ | ✅ |
-| Rust | ❌ | ✅ |
+| Python | YES | YES |
+| TypeScript | YES | YES |
+| JavaScript | YES | YES |
+| Java | YES (partial — pure Python parser) | YES (full resolution) |
+| Kotlin | NO | YES |
+| Go | NO | YES |
+| Rust | NO | YES |
 
 Kotlin, Go, and Rust analysis requires compiled binary dependencies that are part of the hosted SaaS only. Polyglot repos with multiple supported languages are handled automatically — the bundle merges all detected languages into a single artifact.
 

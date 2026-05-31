@@ -135,14 +135,14 @@ def main(argv=None) -> int:
         return 1
 
     # ---- Summary ----------------------------------------------------------
-    print(f"✅ Wrote standard format: {bundle_path}")
+    print(f"Wrote standard format: {bundle_path}")
 
     # Show compressed format info if generated
     if compressed_path and compressed_path.exists():
         standard_size = bundle_path.stat().st_size
         compressed_size = compressed_path.stat().st_size
         savings_pct = (1 - compressed_size / standard_size) * 100
-        print(f"✅ Wrote compressed format: {compressed_path}")
+        print(f"Wrote compressed format: {compressed_path}")
         print(
             f"   Compression: {standard_size:,} → {compressed_size:,} bytes ({savings_pct:.0f}% smaller)"
         )

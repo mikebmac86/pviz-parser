@@ -250,7 +250,7 @@ def build_classic(
         seed_id=home_id,
         direction="classic",
         emit_plan=True,
-        artifacts_dir=art_dir,  # ✅ CRITICAL: ensure classic writes to the intended dir
+        artifacts_dir=art_dir,  # CRITICAL: ensure classic writes to the intended dir
     )
     elapsed_ms = (_t.perf_counter() - t0) * 1000.0
     log_event("CLASSIC:artifacts_end", elapsed_ms=elapsed_ms, artifacts_dir=str(art_dir))

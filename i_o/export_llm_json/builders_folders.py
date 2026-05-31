@@ -299,7 +299,7 @@ def merge_folder_indexes(
     # Collect all non-None indexes
     indexes = [
         idx for idx in [
-            python_idx, ts_idx, go_idx, java_idx, kotlin_idx, rust_idx  # ✅ ADD kotlin_idx
+            python_idx, ts_idx, go_idx, java_idx, kotlin_idx, rust_idx  # ADD kotlin_idx
         ]
         if idx is not None
     ]
