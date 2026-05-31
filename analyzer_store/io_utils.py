@@ -37,9 +37,9 @@ def iso_utc(dt: datetime | float | int | None = None) -> str:
     """Return an ISO-8601 UTC string with seconds precision and trailing 'Z'.
 
     Accepts:
-      • datetime (any tz) → converted to UTC
-      • unix timestamp (float|int) → interpreted as seconds since epoch
-      • None → now()
+      • datetime (any tz) -> converted to UTC
+      • unix timestamp (float|int) -> interpreted as seconds since epoch
+      • None -> now()
     """
     if dt is None:
         dt = datetime.now(timezone.utc)

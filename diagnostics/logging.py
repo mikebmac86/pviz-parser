@@ -231,8 +231,8 @@ ALL_KINDS: Set[str] = {
 # Global config state
 # --------------------------------------------------------------------
 
-# None  → allow all kinds/categories
-# set() → allow all kinds/categories (just no whitelist)
+# None  -> allow all kinds/categories
+# set() -> allow all kinds/categories (just no whitelist)
 _ALLOWED: Optional[Set[str]] = None   # <-- FIX: no stray "PGKZ" string
 _SILENCED: Set[str] = set()  # start with everything silenced by default
 
@@ -250,8 +250,8 @@ def configure(
     Global config:
 
       allowed:
-        - None     → allow all kinds/categories
-        - iterable → ONLY these categories/kinds are printed
+        - None     -> allow all kinds/categories
+        - iterable -> ONLY these categories/kinds are printed
                      (e.g. {"PAINT", "ZONES:zone_pass_begin"})
 
       silenced:
@@ -296,7 +296,7 @@ def log_event(kind: str, *parts: Any, **fields: Any) -> None:
 
     Precedence rules:
 
-      1. If kind is explicitly silenced → always suppressed.
+      1. If kind is explicitly silenced -> always suppressed.
       2. Else if category is silenced:
            - Suppress unless the kind or category is explicitly allowed.
       3. Whitelist (allowed) is checked on both kind and category.

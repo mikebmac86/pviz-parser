@@ -144,7 +144,7 @@ def main(argv=None) -> int:
         savings_pct = (1 - compressed_size / standard_size) * 100
         print(f"Wrote compressed format: {compressed_path}")
         print(
-            f"   Compression: {standard_size:,} → {compressed_size:,} bytes ({savings_pct:.0f}% smaller)"
+            f"   Compression: {standard_size:,} -> {compressed_size:,} bytes ({savings_pct:.0f}% smaller)"
         )
 
     bundle_obj: dict | None = None

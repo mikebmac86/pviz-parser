@@ -520,13 +520,13 @@ def _logical_module_for_path(root: Path, path: Path) -> str:
 
       root = '/project/scrapy/core'
       path = '/project/scrapy/core/downloader/__init__.py'
-      → 'downloader'
+      -> 'downloader'
 
     i.e. we do **not** invent a 'scrapy.core.' prefix. This is why choosing a
     sub-package root like 'scrapy/core' yields ids 'downloader', 'scraper', ...
 
     If resolver fails, we derive from repo-relative POSIX path:
-      rel = 'downloader/__init__.py' → 'downloader'
+      rel = 'downloader/__init__.py' -> 'downloader'
     """
     try:
         _phys, logical_mod = a_resolve.module_names_for_path(root, path)
@@ -738,7 +738,7 @@ def build_folder_index(root: Path, cfg: a_config.AnalyzerCfg) -> FolderIndex:
 
     files3: Dict[str, FileEntry] = {}
     for mod_id, fe in list(files.items()):
-        # Existing: all imports → internal
+        # Existing: all imports -> internal
         all_mods = list(fe.imports_all or ())
         mapped: List[str] = []
         for m in all_mods:
@@ -840,7 +840,7 @@ def save_folder_index(idx: FolderIndex, path: Path) -> None:
     files_payload: Dict[str, dict] = {}
     for k, v in idx.files.items():
         rec = asdict(v)
-        # Rename 'id' → 'folder_id' for clarity
+        # Rename 'id' -> 'folder_id' for clarity
         if "id" in rec:
             rec["folder_id"] = rec.pop("id")
         files_payload[k] = rec

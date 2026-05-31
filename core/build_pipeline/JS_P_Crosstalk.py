@@ -433,7 +433,7 @@ def canon_path_params(path: str, *, hex_threshold: int = 16) -> str:
 
         s = seg.strip()
 
-        # --- Named param syntaxes → :id ---
+        # --- Named param syntaxes -> :id ---
         # Express: :userId
         if s.startswith(":"):
             out.append(":id")
@@ -449,7 +449,7 @@ def canon_path_params(path: str, *, hex_threshold: int = 16) -> str:
             out.append(":id")
             continue
 
-        # --- Literal-ish IDs → :id ---
+        # --- Literal-ish IDs -> :id ---
         if _INT_RE.match(s):
             out.append(":id")
             continue

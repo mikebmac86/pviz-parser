@@ -6,7 +6,7 @@ Edges have a consistent structure but may have optional fields:
   {"src": <path>, "dst": <path>, "kind": <enum>, "evidence": <object>}
 
 This codec applies:
-1. Field abbreviation (src→s, dst→d, kind→k, evidence→e)
+1. Field abbreviation (src->s, dst->d, kind->k, evidence->e)
 2. Enum encoding for "kind" field
 3. Schema-based array encoding
 

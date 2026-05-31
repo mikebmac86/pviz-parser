@@ -31,7 +31,7 @@ def plan_zone_origins(
       2. Siblings at the same depth are arranged horizontally.
       3. This pattern recurses for all child clusters (every level).
       4. Lane index increases as we go down the hierarchy; columns fan
-         out left→right within each sibling group.
+         out left->right within each sibling group.
 
     This is a *coarse* layout that will later be mapped to pixel
     rectangles by scene_apply / ZoneFrameItem. The idea is to get a

@@ -77,7 +77,7 @@ def edge_payload(edge_like: Any, *, scan_root: str | None = None) -> Dict[str, A
     Note: src/dst are normalized to **dotted module ids** using
     canon_module_id(..., scan_root).
     """
-    # Case 1: already a dict → shallow copy; assume upstream normalization,
+    # Case 1: already a dict -> shallow copy; assume upstream normalization,
     # including any 'provenance' key if present.
     if isinstance(edge_like, dict):
         return dict(edge_like)
@@ -85,7 +85,7 @@ def edge_payload(edge_like: Any, *, scan_root: str | None = None) -> Dict[str, A
     # Underlying model edge (if any)
     me = getattr(edge_like, "model_edge", None)
 
-    # Endpoints → derive raw ids (typically repo-relative file ids) first
+    # Endpoints -> derive raw ids (typically repo-relative file ids) first
     src_item = getattr(edge_like, "src_item", None)
     dst_item = getattr(edge_like, "dst_item", None)
     src_id_raw = _as_id(src_item)

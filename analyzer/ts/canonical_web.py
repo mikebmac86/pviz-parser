@@ -214,7 +214,7 @@ def has_web_ext(path: str) -> bool:
 
 def strip_query_and_hash(spec: str) -> str:
     """
-    Handle weird cases: 'foo.js?x=1#y' → 'foo.js'
+    Handle weird cases: 'foo.js?x=1#y' -> 'foo.js'
     """
     s = (spec or "").strip()
     if not s:

@@ -13,7 +13,7 @@ def normalize_root(p: Path | str) -> Path:
     Normalize a user-provided path into a canonical workspace root:
 
       • coerce to Path
-      • ensure directory form (file → parent)
+      • ensure directory form (file -> parent)
       • ensure_dir_root() for robustness
       • resolve() to an absolute, normalized path
 
@@ -140,7 +140,7 @@ def derive_root_if_missing(
     if existing_root:
         return existing_root
 
-    # No root → attempt to infer from the file set.
+    # No root -> attempt to infer from the file set.
     inferred = infer_root_from_files(files)
     if inferred is None:
         return existing_root

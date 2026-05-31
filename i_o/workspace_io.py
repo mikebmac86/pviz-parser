@@ -125,7 +125,7 @@ def _default_app_cache_base() -> Path:
     """
     Preferred base directory for all sandboxed writes (store_root):
 
-      1) If PVIZ_STORE_ROOT is set → use it (expanded & resolved).
+      1) If PVIZ_STORE_ROOT is set -> use it (expanded & resolved).
       2) Otherwise, use <program_root>/.pviz_store.
 
     We intentionally avoid OS user caches (AppData, ~/.cache) to keep artifacts
@@ -155,9 +155,9 @@ def get_paths_or_raise() -> Tuple[Path, Path, Path, Path]:
     Convenience: return (scan_root, store_root, pviz_dir, artifacts_dir)
     for the **active** workspace.
 
-    - scan_root  → external project directory (read-only; analyzer ids are
+    - scan_root  -> external project directory (read-only; analyzer ids are
                    derived relative to this)
-    - store_root → sandbox base; all analyzer/UI artifacts live under here
+    - store_root -> sandbox base; all analyzer/UI artifacts live under here
     """
     wp = get_active_workspace()
     sr = wp.scan_root.resolve()
@@ -202,9 +202,9 @@ class WorkspacePaths:
     """
     Paths for a single workspace.
 
-    scan_root  → the external project directory (READ-ONLY; analyzer/ids are
+    scan_root  -> the external project directory (READ-ONLY; analyzer/ids are
                  derived relative to this)
-    store_root → the app's sandbox/cache for ALL WRITES:
+    store_root -> the app's sandbox/cache for ALL WRITES:
 
                   <base>/workspaces/<wsid>/
                   └─ .pviz/

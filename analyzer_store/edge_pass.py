@@ -33,7 +33,7 @@ def _loads_bytes(data: bytes) -> Dict[str, Any]:
 
 
 def _load_json(path: Path) -> Dict[str, Any]:
-    """Read JSON from disk using bytes → fast loads; tolerant to errors."""
+    """Read JSON from disk using bytes -> fast loads; tolerant to errors."""
     try:
         return _loads_bytes(Path(path).read_bytes())
     except Exception:
@@ -71,10 +71,10 @@ def _token_parts(token: str) -> List[str]:
       - Dotted ids like 'scrapy.core.engine'
 
     For NodeIds:
-      'scrapy/core/engine.py'    → ['scrapy', 'core', 'engine']
-      'scrapy/core/__init__.py'  → ['scrapy', 'core']
+      'scrapy/core/engine.py'    -> ['scrapy', 'core', 'engine']
+      'scrapy/core/__init__.py'  -> ['scrapy', 'core']
     For dotted:
-      'scrapy.core.engine'       → ['scrapy', 'core', 'engine']
+      'scrapy.core.engine'       -> ['scrapy', 'core', 'engine']
     """
     t = token.replace("\\", "/").rstrip("/")
     # Path-like?
@@ -108,7 +108,7 @@ def _is_shallower(a: str, b: str) -> bool:
 def _strict_edges(nf_nodes: Dict[str, Dict[str, Any]], scope: Set[str]) -> List[Dict[str, Any]]:
     """
     Emit edges strictly within `scope`, using canonical direction:
-      provider → consumer.
+      provider -> consumer.
 
     IDs here are the canonical NodeIds (file-ids), i.e. repo-relative POSIX
     paths with '.py' or '/__init__.py', as emitted by NodeFacts. Example:
@@ -183,7 +183,7 @@ def _soft_edges(nf_nodes: Dict[str, Dict[str, Any]], scope: Set[str]) -> List[Di
       - NodeIds / file-ids (preferred): 'scrapy/core/engine.py'
       - Dotted ids (legacy): 'scrapy.core.engine'
 
-    Canonical direction preserved: provider → consumer. Marks inferred edges
+    Canonical direction preserved: provider -> consumer. Marks inferred edges
     with `inferred=True`.
 
     Attaches per-import metadata from `imports_meta` when available (same shape
@@ -192,12 +192,12 @@ def _soft_edges(nf_nodes: Dict[str, Dict[str, Any]], scope: Set[str]) -> List[Di
     ids = sorted(scope)
     idset = set(ids)
 
-    # index by strict prefixes → best (shallowest) child within scope
+    # index by strict prefixes -> best (shallowest) child within scope
     prefix_choice: Dict[str, str] = {}
     for cid in ids:
         parts = _token_parts(cid)
         # For NodeIds, prefixes are dotted or path-ish "modules":
-        #   ['scrapy', 'core', 'engine'] → 'scrapy', 'scrapy.core'
+        #   ['scrapy', 'core', 'engine'] -> 'scrapy', 'scrapy.core'
         for k in range(1, len(parts)):
             pref = ".".join(parts[:k])
             best = prefix_choice.get(pref)
@@ -277,7 +277,7 @@ def _soft_edges(nf_nodes: Dict[str, Dict[str, Any]], scope: Set[str]) -> List[Di
 
             # Unique basename fallback (only if unambiguous within scope).
             # For NodeIds we use the stem:
-            #   'scrapy/core/engine.py' → 'engine'
+            #   'scrapy/core/engine.py' -> 'engine'
             base_parts = _token_parts(mod_token)
             base = base_parts[-1] if base_parts else ""
             if not base:
@@ -322,8 +322,8 @@ def _pkg_root_for_init(node_id: str) -> Optional[str]:
     If node_id is a package __init__ file, return its package path
     (directory part), e.g.:
 
-        'diagnostics/__init__.py'     → 'diagnostics'
-        'ui/window/main/__init__.py'  → 'ui/window/main'
+        'diagnostics/__init__.py'     -> 'diagnostics'
+        'ui/window/main/__init__.py'  -> 'ui/window/main'
 
     Otherwise return None.
     """
@@ -337,10 +337,10 @@ def _collapse_pkg_parent_edges(edges: List[Dict[str, Any]]) -> List[Dict[str, An
     """
     For each consumer (dst), if there are edges from both:
 
-        pkg/__init__.py → dst
-        pkg/...something.py → dst
+        pkg/__init__.py -> dst
+        pkg/...something.py -> dst
 
-    under the same package root, drop the pkg/__init__.py → dst edges.
+    under the same package root, drop the pkg/__init__.py -> dst edges.
 
     This keeps real package-level imports (only __init__ present) but
     avoids "double edges" where a single logical import resolves to

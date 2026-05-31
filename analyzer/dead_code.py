@@ -296,7 +296,7 @@ def _collect_from_imports_by_provider(
                     if prov and al:
                         alias_map[al] = prov
 
-        # pass 2: alias.attr uses → credit symbol to provider
+        # pass 2: alias.attr uses -> credit symbol to provider
         if alias_map:
             used_by_provider: Dict[str, Set[str]] = {}
 

@@ -133,7 +133,7 @@ def _resolve_relative_module(src_mod: Optional[str], rel: str) -> Optional[str]:
 
 def _norm_node_id_to_module(node_id: str) -> Optional[str]:
     """
-    Best-effort mapper from NodeId → module id.
+    Best-effort mapper from NodeId -> module id.
 
     Under the current contracts, NodeId *is already* the module id
     (e.g. 'scrapy.core.engine', 'ui.app.run_gui'), so this is mostly
@@ -155,7 +155,7 @@ def infer_edges_from_import(
 ) -> Dict[str, Any]:
     """
     Node ids are treated as stable, dotted module ids; we never shorten them to
-    'core.engine' style. Resolution from import tokens → NodeId goes through
+    'core.engine' style. Resolution from import tokens -> NodeId goes through
     module/file alias tables only.
     """
     def _ek(g_like: Any) -> int:
@@ -164,7 +164,7 @@ def infer_edges_from_import(
         except Exception:
             return -1
 
-    # Coerce graph → plain dict
+    # Coerce graph -> plain dict
     if graph is None:
         g: Dict[str, Any] = {"nodes": {}, "edges": []}
     elif isinstance(graph, dict):
@@ -227,7 +227,7 @@ def infer_edges_from_import(
         uniq_pairs=uniq_pairs_in,
     )
 
-    # 3) Build resolvers: module/file → node_id
+    # 3) Build resolvers: module/file -> node_id
     module_to_id: Dict[str, str] = {}
     file_to_id: Dict[str, str] = {}
 
@@ -236,7 +236,7 @@ def infer_edges_from_import(
         Index a module id and its dotted prefixes to the same NodeId.
 
         Example:
-          'scrapy.core.engine' →
+          'scrapy.core.engine' ->
             'scrapy.core.engine', 'scrapy.core', 'scrapy'
         """
         if not mod:
@@ -290,8 +290,8 @@ def infer_edges_from_import(
         Map an import token (dotted module or path-like) back to a NodeId.
 
         Resolution goes through:
-          - canon_module_id → module_to_id
-          - canon_file_id   → file_to_id
+          - canon_module_id -> module_to_id
+          - canon_file_id   -> file_to_id
         We never generate ad-hoc 'core.engine' ids here.
         """
         if not token:

@@ -190,7 +190,7 @@ def _to_plain(obj: Any) -> dict:
       - objects with .to_dict()
       - dataclasses (via asdict)
       - objects with __dict__
-      - simple primitives (str/int/float/bool/None) → wrapped as {"value": ...}
+      - simple primitives (str/int/float/bool/None) -> wrapped as {"value": ...}
 
     The primitive wrapping avoids hard failures when analyzer payloads use
     simple values (e.g. reasons as strings) instead of full dicts.

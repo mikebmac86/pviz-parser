@@ -44,7 +44,7 @@ def validate_nodefacts(nf: NodeFacts) -> List[str]:
     if sum_in != sum_out:
         issues.append(f"degree_sum_mismatch:in={sum_in},out={sum_out}")
 
-    # reciprocity: for every A→B in imports, A ∈ exports[B]
+    # reciprocity: for every A->B in imports, A ∈ exports[B]
     for a, na in nodes.items():
         for b in na.imports:
             nb = nodes.get(b)

@@ -200,9 +200,9 @@ class CandidateV1(TypedDict, total=False):
 # - Starlette: similar to FastAPI (0.9-1.0)
 #
 # Path parameter styles (all normalize to :id):
-# - FastAPI: {user_id} → :id (confidence 1.0)
-# - Flask: <int:user_id> or <user_id> → :id (confidence 1.0)
-# - Django: <int:pk> → :id (confidence 0.5-1.0, v1.1+)
+# - FastAPI: {user_id} -> :id (confidence 1.0)
+# - Flask: <int:user_id> or <user_id> -> :id (confidence 1.0)
+# - Django: <int:pk> -> :id (confidence 0.5-1.0, v1.1+)
 #
 # ============================================================================
 
@@ -294,19 +294,19 @@ def canon_path_params(path: str, *, hex_threshold: int = 12) -> str:
     Normalize obvious ID segments and unify parameter patterns.
     
     Transformations:
-      - Pure integers → ':id'
-      - UUIDs → ':id'
-      - Long hex tokens (>= hex_threshold) → ':id'
-      - Named params (various formats) → ':id' (unified)
+      - Pure integers -> ':id'
+      - UUIDs -> ':id'
+      - Long hex tokens (>= hex_threshold) -> ':id'
+      - Named params (various formats) -> ':id' (unified)
     
     This unification ensures cross-language matching works even when
     parameter names differ (e.g., FastAPI {user_id} matches TS :userId).
     
     Supported parameter formats:
-      - Express/generic: :userId → :id
-      - FastAPI: {user_id} → :id
-      - Flask: <int:user_id> or <user_id> → :id
-      - Django: <int:pk> → :id (v1.1+)
+      - Express/generic: :userId -> :id
+      - FastAPI: {user_id} -> :id
+      - Flask: <int:user_id> or <user_id> -> :id
+      - Django: <int:pk> -> :id (v1.1+)
 
     Args:
         path: Normalized path
@@ -932,11 +932,11 @@ TEST_CASES = [
 #   - Handle both Call nodes and Name nodes (for decorator references)
 #
 # Path parameter normalization:
-#   - FastAPI: {user_id} → :id (always)
-#   - Flask: <int:user_id> → :id (always)
-#   - Flask: <user_id> → :id (always)
-#   - Flask: <path:filepath> → :id (always)
-#   - Django: <int:pk> → :id (v1.1+)
+#   - FastAPI: {user_id} -> :id (always)
+#   - Flask: <int:user_id> -> :id (always)
+#   - Flask: <user_id> -> :id (always)
+#   - Flask: <path:filepath> -> :id (always)
+#   - Django: <int:pk> -> :id (v1.1+)
 #
 # Example AST pattern detection:
 #
@@ -960,21 +960,21 @@ TEST_CASES = [
 #     Need to track blueprint prefix for full path
 #
 # Environment variable detection:
-#   - os.getenv(literal_string) → confidence 1.0
+#   - os.getenv(literal_string) -> confidence 1.0
 #     AST: Call(func=Attribute(value=Name('os'), attr='getenv'),
 #              args=[Constant('VAR_NAME')])
-#   - os.environ[literal_string] → confidence 1.0
+#   - os.environ[literal_string] -> confidence 1.0
 #     AST: Subscript(value=Attribute(value=Name('os'), attr='environ'),
 #                   slice=Constant('VAR_NAME'))
-#   - os.environ.get(literal_string) → confidence 1.0
+#   - os.environ.get(literal_string) -> confidence 1.0
 #     AST: Call(func=Attribute(...), args=[Constant('VAR_NAME')])
-#   - os.getenv(variable) → SKIP (too dynamic)
-#   - Settings.FIELD access → v1.1+ (requires pydantic inspection)
+#   - os.getenv(variable) -> SKIP (too dynamic)
+#   - Settings.FIELD access -> v1.1+ (requires pydantic inspection)
 #
 # Socket event detection:
-#   - @socketio.on('event_name') → confidence 1.0
+#   - @socketio.on('event_name') -> confidence 1.0
 #     AST: Decorator with Call to socketio.on with string arg
-#   - socketio.emit('event_name', data) → confidence 1.0
+#   - socketio.emit('event_name', data) -> confidence 1.0
 #     AST: Call to socketio.emit with string first arg
 #
 # Error handling:
@@ -1006,7 +1006,7 @@ TEST_CASES = [
 #   - Track Blueprint registration: app.register_blueprint(bp, url_prefix='/v1')
 #   - Combine prefixes: blueprint_prefix + registration_prefix + route_path
 #   - Example: bp('/users') with url_prefix='/api' and register('/v1')
-#     → final path: /v1/api/users
+#     -> final path: /v1/api/users
 #
 # Django urlpatterns considerations (v1.1+):
 #   - Parse urlpatterns list: [path('users/', view), path('users/<int:pk>/', view)]

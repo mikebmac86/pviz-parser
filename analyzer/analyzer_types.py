@@ -45,7 +45,7 @@ class ParsedModule:
     all_exports: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
 
-    # Crosstalk candidates (Python → TS/JS), Level 1 facts only
+    # Crosstalk candidates (Python -> TS/JS), Level 1 facts only
     # Populated by analyzer/python/extract_crosstalk.py
     crosstalk_candidates_py_v1: List[Dict[str, Any]] = field(default_factory=list)
 
@@ -88,7 +88,7 @@ class FileNode:
     warnings: List[str] = field(default_factory=list)
     meta: Dict[str, Any] = field(default_factory=dict)
 
-    # Crosstalk candidates (Python → TS/JS), Level 1 facts only
+    # Crosstalk candidates (Python -> TS/JS), Level 1 facts only
     crosstalk_candidates_py_v1: List[Dict[str, Any]] = field(default_factory=list)
 
     # Optional: stash parser product for downstream edge-building
@@ -156,7 +156,7 @@ class EdgeEvidence:
     reason: str
 
 # ----------------------------
-# Edge model (file → file)
+# Edge model (file -> file)
 # ----------------------------
 
 @dataclass
@@ -166,7 +166,7 @@ class EdgeReason:
       - symbols: imported names (or [module] if unknown)
       - conditional: True if came from a typing/conditional context
       - ambiguous: True for star imports or unresolved details
-      - unresolved: reserved for future richer analysis (symbol→def not found)
+      - unresolved: reserved for future richer analysis (symbol->def not found)
     """
     symbols: List[str] = field(default_factory=list)
     conditional: bool = False
@@ -177,7 +177,7 @@ class EdgeReason:
 class Edge:
     """
     Directed relationship between two FileNodes.
-    Convention: src → dst means "src provides, dst consumes".
+    Convention: src -> dst means "src provides, dst consumes".
     For import edges: src = defining module (producer), dst = importer (consumer).
     """
     src: FileId

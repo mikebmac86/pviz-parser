@@ -16,7 +16,7 @@ import json  # fallback
 
 
 # ---------------------------------------------------------------------------
-# Logging shim → central diagnostics
+# Logging shim -> central diagnostics
 # ---------------------------------------------------------------------------
 def _log(kind: str, *parts, **fields) -> None:
     """

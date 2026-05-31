@@ -113,7 +113,7 @@ def canon_path_rel(s: Posixish | None, scan_root: Posixish | None) -> str:
     This is the core helper for anchoring ids at the scan root:
       abs 'C:/.../scrapy-master/scrapy/core/engine.py'
         + scan_root 'C:/.../scrapy-master'
-      → 'scrapy/core/engine.py'
+      -> 'scrapy/core/engine.py'
     """
     p = to_posix(s)
     root = _normalize_root_arg(scan_root)
@@ -196,10 +196,10 @@ def canon_module_id(
       • If dotted: returned as-is.
 
     Examples:
-      path='scrapy/core/engine.py'           → 'scrapy.core.engine'
+      path='scrapy/core/engine.py'           -> 'scrapy.core.engine'
       path='C:/proj/scrapy/core/engine.py',
-        scan_root='C:/proj'                 → 'scrapy.core.engine'
-      dotted='scrapy.core.engine'           → 'scrapy.core.engine'
+        scan_root='C:/proj'                 -> 'scrapy.core.engine'
+      dotted='scrapy.core.engine'           -> 'scrapy.core.engine'
     """
     if not s:
         return ""
@@ -297,7 +297,7 @@ def normalize_root(repo_root: Optional[Pathish]) -> Optional[Path]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ID variants (module/path → canonical variants)
+# ID variants (module/path -> canonical variants)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def id_variants(token: str, scan_root: Optional[Pathish] = None) -> list[str]:

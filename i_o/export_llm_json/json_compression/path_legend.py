@@ -68,9 +68,9 @@ def rewrite_nodes_rows_with_path_ids(nodes: Dict[str, Any], path_to_id: Dict[str
     Rewrite node rows to use path IDs instead of path strings.
     
     Handles:
-    1. Row dict keys (node IDs) → row_ids array
-    2. Path string fields (file, node_id) → path IDs (non-negative integers)
-    3. Path array fields (imports) → arrays of path IDs
+    1. Row dict keys (node IDs) -> row_ids array
+    2. Path string fields (file, node_id) -> path IDs (non-negative integers)
+    3. Path array fields (imports) -> arrays of path IDs
     """
     rows = nodes.get("rows")
     if not isinstance(rows, dict) or not rows:

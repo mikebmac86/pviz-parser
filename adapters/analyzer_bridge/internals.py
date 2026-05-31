@@ -29,8 +29,8 @@ def ok(*vals) -> bool:
     """
     Backwards-compatible env-based filter:
 
-      • If PVIZ_LOG_FILTER is unset/empty → always True.
-      • Else → True if any value stringifies to something containing the filter.
+      • If PVIZ_LOG_FILTER is unset/empty -> always True.
+      • Else -> True if any value stringifies to something containing the filter.
     """
     if not _PF:
         return True
@@ -168,7 +168,7 @@ def edge_dedupe_key(e: Dict[str, Any]) -> Tuple[str, str, str, str, str]:
     dst_contact = _c(e.get("dst_contact"))
     return (src, dst, kind, src_contact, dst_contact)
 
-# ---- import row → annotations (from lexical refs) ---------------------------
+# ---- import row -> annotations (from lexical refs) ---------------------------
 
 def build_import_row_annotations(imp_rows: List[str], parsed: Any) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
