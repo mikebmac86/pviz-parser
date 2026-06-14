@@ -73,12 +73,14 @@ A compressed format is also generated alongside the standard bundle (`.compresse
 | Kotlin | NO | YES |
 | Go | NO | YES |
 | Rust | NO | YES |
+| Ruby | NO | YES |
 
-Kotlin, Go, and Rust analysis requires compiled binary dependencies that are part of the hosted SaaS only. Polyglot repos with multiple supported languages are handled automatically — the bundle merges all detected languages into a single artifact.
+Kotlin, Go, and Rust analysis requires compiled binary dependencies that are part of the hosted SaaS only. Ruby analysis includes Rails-aware extraction — ActiveRecord associations, callbacks, scopes, validations, and route DSL are surfaced as structured per-file facts and cross-file `rails_association` edges. Polyglot repos with multiple supported languages are handled automatically — the bundle merges all detected languages into a single artifact.
+
 
 ## CLI vs SaaS
 
-`pviz-parser` is the open source CLI. It runs locally, produces bundles you own, and supports Python, TypeScript, JavaScript, and partial resolution for Java out of the box.
+`pviz-parser` is the open source CLI. It runs locally, produces bundles you own, and supports Python, TypeScript, JavaScript, Ruby (including Rails), and partial resolution for Java out of the box.
 
 [pvizgenerator.com](https://pvizgenerator.com) is the hosted SaaS layer. It adds full Kotlin, Go, and Rust support, hosted bundle storage, bundle diffing across commits, and MCP delivery for direct LLM tool integration — without running anything locally.
 
