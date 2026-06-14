@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import sys
-sys.path.insert(0, r"C:\Users\mbm93\Desktop\package\saas_analyzer")
-
 import json
 import argparse
 from pathlib import Path
