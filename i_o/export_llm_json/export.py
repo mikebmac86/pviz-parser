@@ -63,6 +63,11 @@ def _infer_rust_from_node(n: Mapping[str, Any], nid: str) -> bool:
     # Fallback: node id might be file-id style
     return Path(nid).suffix.lower() == ".rs"
 
+def _infer_ruby_from_node(n: Mapping[str, Any], nid: str) -> bool:
+    f = n.get("file")
+    if isinstance(f, str) and f:
+        return Path(f).suffix.lower() in (".rb", ".rake", ".gemspec", ".ru")
+    return Path(nid).suffix.lower() in (".rb", ".rake", ".gemspec", ".ru")
 
 def _norm_lang(s: str) -> str:
     """
@@ -87,6 +92,8 @@ def _norm_lang(s: str) -> str:
         "kotlin": "kotlin",
         "kt": "kotlin",
         "kts": "kotlin",
+        "ruby": "ruby",
+        "rb": "ruby",
     }
     return aliases.get(v, v)
 
@@ -152,7 +159,20 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
         "rust/folder_index_rust.json",
         "rust/folder_index.json",
     )
-    
+
+    ruby_folder_index_path = find_optional_artifact(
+        artifact_dir,
+        "analyzers/ruby/folder_index_ruby.json",
+        "analyzers/ruby/folder_index.json",
+        "ruby/folder_index_ruby.json",
+        "ruby/folder_index.json",
+    )
+
+    ruby_indexes_path = find_optional_artifact(
+        artifact_dir,
+        "ruby_analysis_indexes.json",
+    )
+
     reachable_path = find_optional_artifact(artifact_dir, "reachable.json")
     discovery_path = find_optional_artifact(
         artifact_dir,
@@ -214,6 +234,8 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
                 nn["language"] = "kotlin"
             elif _infer_rust_from_node(nn, nid):
                 nn["language"] = "rust"
+            elif _infer_ruby_from_node(nn, nid):
+                nn["language"] = "ruby"
 
         nodes2[nid] = nn
     nodes = nodes2
@@ -238,6 +260,7 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
         java=str(java_folder_index_path) if java_folder_index_path else None,
         kotlin=str(kotlin_folder_index_path) if kotlin_folder_index_path else None,
         rust=str(rust_folder_index_path) if rust_folder_index_path else None,
+        ruby=str(ruby_folder_index_path) if ruby_folder_index_path else None,
     )
 
     # Folder index is expected to be canonical (folder_index.json), but keep
@@ -248,7 +271,8 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
     java_folder_index = load_json_optional(java_folder_index_path) if java_folder_index_path is not None else None
     kotlin_folder_index = load_json_optional(kotlin_folder_index_path) if kotlin_folder_index_path is not None else None
     rust_folder_index = load_json_optional(rust_folder_index_path) if rust_folder_index_path is not None else None
-
+    ruby_folder_index = load_json_optional(ruby_folder_index_path) if ruby_folder_index_path is not None else None
+    
     merged_folder_index = merge_folder_indexes(
         python_folder_index,
         ts_folder_index,
@@ -256,6 +280,7 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
         java_folder_index,
         kotlin_folder_index,
         rust_folder_index,
+        ruby_folder_index,
     )
 
     log_event(
@@ -266,6 +291,7 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
         java=_fi_count(java_folder_index),
         kotlin=_fi_count(kotlin_folder_index),
         rust=_fi_count(rust_folder_index),
+        ruby=_fi_count(ruby_folder_index),
         merged=_fi_count(merged_folder_index),
     )
 
@@ -277,6 +303,8 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
     if folders is not None and isinstance(folders, Mapping) and isinstance(folders.get("files"), Mapping):
         import_summary = compute_import_summary(folders["files"])  # type: ignore[arg-type]
 
+    ruby_indexes = load_json_optional(ruby_indexes_path) if ruby_indexes_path is not None else None
+
     generated_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     # --- Derive bundled language(s) from nodes (polyglot-safe) ---
@@ -287,6 +315,7 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
     inferred_java = 0
     inferred_kotlin = 0
     inferred_rust = 0
+    inferred_ruby = 0
 
     for nid, n in (nodes or {}).items():
         if not isinstance(n, Mapping):
@@ -303,7 +332,7 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
         raw_kind = n.get("kind")
         if isinstance(raw_kind, str) and raw_kind.strip():
             k = _norm_lang(raw_kind)
-            if k in ("python", "typescript", "javascript", "go", "java", "rust"):
+            if k in ("python", "typescript", "javascript", "go", "java", "rust", "ruby"):
                 bundled_langs[k] += 1
                 continue
 
@@ -323,6 +352,9 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
         elif _infer_rust_from_node(n, nid):
             bundled_langs["rust"] += 1
             inferred_rust += 1
+        elif _infer_ruby_from_node(n, nid):
+            bundled_langs["ruby"] += 1
+            inferred_ruby += 1
         else:
             missing_explicit_lang += 1
 
@@ -343,6 +375,7 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
         inferred_java=inferred_java,
         inferred_kotlin=inferred_kotlin,
         inferred_rust=inferred_rust,
+        inferred_ruby=inferred_ruby,
         missing_explicit_lang=missing_explicit_lang,
     )
 
@@ -357,6 +390,7 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
             "java": {".java"},
             "kotlin": {".kt", ".kts"},
             "rust": {".rs"},
+            "ruby": {".rb", ".rake", ".gemspec", ".ru"},
         }
         out: Set[str] = set()
         for l in langs:
@@ -497,8 +531,19 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
 
         meta["metrics_source"] = metrics_summary.get("metrics_source") or "merged_folder_index"
 
+    # Rails detection — read from Ruby folder index meta if present
+    if ruby_folder_index is not None and isinstance(ruby_folder_index, Mapping):
+        ruby_fi_meta = ruby_folder_index.get("meta")
+        if isinstance(ruby_fi_meta, Mapping):
+            rails_raw = ruby_fi_meta.get("rails_detected")
+            if rails_raw is not None:
+                if isinstance(rails_raw, bool):
+                    meta["rails_detected"] = rails_raw
+                elif isinstance(rails_raw, str):
+                    meta["rails_detected"] = rails_raw.lower() == "true"
+
     bundle: Dict[str, Any] = {
-        "schema_version": "pviz-llm-bundle@v1.1",
+        "schema_version": "pviz-llm-bundle@v1.2",
         "meta": meta,
         "nodes": nodes,
         "edges": edges,
@@ -537,6 +582,9 @@ def export_llm_bundle(config: LLMExportConfig) -> Path:
             else None
         ),
     )
+
+    if ruby_indexes is not None and isinstance(ruby_indexes, Mapping):
+        bundle["indexes"] = {"ruby": ruby_indexes}
 
     if discovery_data is not None and isinstance(discovery_data, Mapping):
         bundle["discovery"] = build_discovery(discovery_data, nodes=nodes)

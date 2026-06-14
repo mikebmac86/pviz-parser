@@ -84,6 +84,8 @@ def _default_skip_dirs() -> Set[str]:
         ".vscode",
         ".venv",
         "venv",
+        ".bundle",
+        "coverage",
         "__pycache__",
         ".mypy_cache",
         ".pytest_cache",
@@ -112,7 +114,7 @@ def _classify_lang(ext: str) -> str:
         return "json"
     if e in (".yaml", ".yml"):
         return "yaml"
-    if e in (".md",):
+    if e in (".md", ".mdx"):
         return "markdown"
     if e in (".html", ".htm"):
         return "html"
@@ -130,7 +132,7 @@ def _classify_lang(ext: str) -> str:
         return "csharp"
     if e in (".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh"):
         return "cpp"
-    if e in (".rb",):
+    if e in (".rb", ".rake", ".gemspec", ".ru"):
         return "ruby"
     if e in (".php",):
         return "php"
@@ -704,6 +706,207 @@ def _discover_kotlin_seeds(sr: Path, files_rows: List[Dict[str, Any]]) -> Dict[s
         "warnings": warnings,
     }
 
+# --- Ruby discovery ---------------------------------------------------------
+
+_RE_RUBY_SHEBANG = re.compile(r"^#!.*\bruby\b", re.M)
+_RE_RUBY_RAILS_APP = re.compile(r"\bclass\s+Application\s*<\s*Rails::Application\b", re.M)
+_RE_RUBY_RACK_RUN = re.compile(r"^\s*run\s+[\w:]+", re.M)
+_RE_RUBY_RAKE_TASK = re.compile(r"^\s*task\s+[:'\"]?([A-Za-z0-9_\-:]+)", re.M)
+_RE_RUBY_SIDEKIQ = re.compile(r"\bSidekiq\b", re.M)
+_RE_RUBY_PROCFILE_WEB = re.compile(r"^web\s*:", re.M)
+_RE_RUBY_PROCFILE_WORKER = re.compile(r"^worker\s*:", re.M)
+
+
+def _discover_ruby_seeds(sr: Path, files_rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Discover Ruby entrypoints.
+
+    Detects:
+    - executable Ruby scripts via shebang
+    - common bin/ scripts
+    - Rails application config
+    - Rack config.ru files
+    - Rakefile / .rake task files
+    - Sidekiq worker/config signals
+    - Procfile web/worker process declarations (Heroku/Foreman)
+    """
+    ruby_files = [
+        r["path"] for r in files_rows
+        if r.get("lang") == "ruby" and isinstance(r.get("path"), str)
+    ]
+
+    # Procfile is not a Ruby source file (lang="other") so we need to scan
+    # for it separately using the full files list.
+    all_paths = {r["path"] for r in files_rows if isinstance(r.get("path"), str)}
+
+    seeds: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+
+    for rel_posix in ruby_files:
+        lp = rel_posix.lower()
+        txt = _safe_read_text(sr / rel_posix)
+        if not txt:
+            continue
+
+        base = rel_posix.rsplit("/", 1)[-1]
+
+        # Strong executable script signal.
+        if _RE_RUBY_SHEBANG.search(txt):
+            seeds.append(_seed(
+                "ruby_script_shebang",
+                rel_posix,
+                confidence=0.95,
+                priority=5,
+                evidence=["shebang:ruby"],
+                source="ruby_script_detect",
+            ))
+
+        # Conventional executable scripts in Ruby/Rails projects.
+        if rel_posix.startswith("bin/") and base in {
+            "rails",
+            "rake",
+            "bundle",
+            "setup",
+            "console",
+            "server",
+            "jobs",
+            "sidekiq",
+        }:
+            seeds.append(_seed(
+                "ruby_bin_script",
+                rel_posix,
+                confidence=0.92,
+                priority=6,
+                evidence=[f"conventional_bin_script:{base}"],
+                source="ruby_bin_detect",
+            ))
+
+        # Rack entrypoint.
+        if lp.endswith("config.ru"):
+            ev = ["file:config.ru"]
+            conf = 0.93
+            if _RE_RUBY_RACK_RUN.search(txt):
+                conf = 0.97
+                ev.append("rack:run")
+            seeds.append(_seed(
+                "ruby_rack_config",
+                rel_posix,
+                confidence=conf,
+                priority=4,
+                evidence=ev,
+                source="ruby_rack_detect",
+            ))
+
+        # Rails application config.
+        if lp.endswith("config/application.rb") and _RE_RUBY_RAILS_APP.search(txt):
+            seeds.append(_seed(
+                "ruby_rails_application",
+                rel_posix,
+                symbol="Application",
+                confidence=0.97,
+                priority=4,
+                evidence=["class Application < Rails::Application"],
+                source="ruby_rails_detect",
+            ))
+
+        # Rails environment boot file.
+        if lp.endswith("config/environment.rb"):
+            seeds.append(_seed(
+                "ruby_rails_environment",
+                rel_posix,
+                confidence=0.90,
+                priority=8,
+                evidence=["file:config/environment.rb"],
+                source="ruby_rails_detect",
+            ))
+
+        # Rake entrypoints.
+        if base == "Rakefile" or lp.endswith(".rake"):
+            ev = ["rake_file"]
+            conf = 0.86
+            if _RE_RUBY_RAKE_TASK.search(txt):
+                conf = 0.91
+                ev.append("defines_rake_task")
+            seeds.append(_seed(
+                "ruby_rake_file",
+                rel_posix,
+                confidence=conf,
+                priority=10,
+                evidence=ev,
+                source="ruby_rake_detect",
+            ))
+
+        # Gemspec — useful package-root seed even though not an executable entrypoint.
+        if lp.endswith(".gemspec"):
+            seeds.append(_seed(
+                "ruby_gemspec",
+                rel_posix,
+                confidence=0.88,
+                priority=12,
+                evidence=["file:gemspec"],
+                source="ruby_package_detect",
+            ))
+
+        # Sidekiq signal — worker seed rather than app entrypoint.
+        if _RE_RUBY_SIDEKIQ.search(txt):
+            seeds.append(_seed(
+                "ruby_sidekiq_signal",
+                rel_posix,
+                confidence=0.78,
+                priority=18,
+                evidence=["found:Sidekiq"],
+                source="ruby_worker_detect",
+            ))
+
+    # ------------------------------------------------------------------
+    # Procfile detection (Heroku/Foreman process declarations).
+    #
+    # Procfile is not a Ruby source file so it won't appear in ruby_files.
+    # We scan it separately from the full files list.
+    # A Procfile with a "web:" line is a strong signal that this is a
+    # rack/Rails app; "worker:" lines indicate background job processes.
+    # We emit the Procfile itself as the seed since it IS the process
+    # declaration — not the Ruby file it references, which we don't parse here.
+    # ------------------------------------------------------------------
+    for procfile_name in ("Procfile", "Procfile.dev"):
+        if procfile_name not in all_paths:
+            continue
+
+        rel_posix = procfile_name
+        txt = _safe_read_text(sr / rel_posix)
+        if not txt:
+            continue
+
+        has_web = bool(_RE_RUBY_PROCFILE_WEB.search(txt))
+        has_worker = bool(_RE_RUBY_PROCFILE_WORKER.search(txt))
+
+        if not (has_web or has_worker):
+            continue
+
+        ev = [f"file:{procfile_name}"]
+        if has_web:
+            ev.append("procfile:web")
+        if has_worker:
+            ev.append("procfile:worker")
+
+        # Web process is a stronger entrypoint signal than worker alone.
+        conf = 0.88 if has_web else 0.75
+        seeds.append(_seed(
+            "ruby_procfile",
+            rel_posix,
+            confidence=conf,
+            priority=7,
+            evidence=ev,
+            source="ruby_procfile_detect",
+        ))
+
+    seeds = _rank_and_dedupe_seeds(seeds)
+
+    return {
+        "seeds": seeds,
+        "warnings": warnings,
+    }
+
 # --- Rust discovery ---------------------------------------------------------
 
 _RE_RUST_FN_MAIN = re.compile(r'^\s*fn\s+main\s*\(\s*\)', re.M)
@@ -823,13 +1026,23 @@ def build_discovery_manifest(*, scan_root: Path) -> Tuple[dict, ManifestSummary]
 
             base = p.name.lower()
 
-            # filename-based language hints (no extension)
+            # filename-based language hints (no extension / ecosystem-specific names)
             if base == "go.mod":
                 lang = "go"
                 ext = ".mod"
             elif base == "go.sum":
                 lang = "go"
                 ext = ".sum"
+            elif base in {
+                "gemfile",
+                "rakefile",
+                "guardfile",
+                "capfile",
+                "vagrantfile",
+                "config.ru",
+            }:
+                lang = "ruby"
+                ext = ""
 
             by_lang[lang] = by_lang.get(lang, 0) + 1
             files.append(
@@ -893,6 +1106,14 @@ def build_discovery_manifest(*, scan_root: Path) -> Tuple[dict, ManifestSummary]
         manifest["kotlin"] = {
             "seeds": [],
             "warnings": [{"kind": "kotlin_seed_discovery_failed", "evidence": [repr(e)]}],
+        }
+
+    try:
+        manifest["ruby"] = _discover_ruby_seeds(sr, files)
+    except Exception as e:
+        manifest["ruby"] = {
+            "seeds": [],
+            "warnings": [{"kind": "ruby_seed_discovery_failed", "evidence": [repr(e)]}],
         }
 
     return manifest, ManifestSummary(total_files=len(files))

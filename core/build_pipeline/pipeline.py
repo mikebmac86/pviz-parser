@@ -42,83 +42,105 @@ def _default_cleanup_tmp(tmp_root: Path) -> None:
 
 def _norm_from_canonical(artifacts_dir: Path) -> Optional[Dict[str, Any]]:
     try:
-        # Default classic locations (root)
-        nf_p = artifacts_dir / "nodefacts.json"
-        e_p = artifacts_dir / "edges.json"
-
-        # Newer canonical edge locations (if present)
-        canonical_edge_candidates = [
-            artifacts_dir / "classic" / "edges" / "full.json",
-            artifacts_dir / "classic" / "edges" / "full",  # some code treats as path-ish
-        ]
-
-        # Candidate bases in descending preference:
-        #  1) root canonical (classic)
-        #  2) newer canonical "classic/edges/full.json"
-        #  3) analyzer subdirs (historical)
-        #  4) per-language artifact dirs (java/ts/go lanes)
-        candidates = [
-            artifacts_dir,
-            artifacts_dir / "analyzers" / "ts",
-            artifacts_dir / "analyzers" / "go",
-            artifacts_dir / "analyzers" / "java",
-            artifacts_dir / "ts",
-            artifacts_dir / "go",
-            artifacts_dir / "java",
-        ]
-
-        loaded_base: Optional[Path] = None
-
-        # First: if root has nodefacts, prefer it (keeps classic behavior)
+        # ------------------------------------------------------------------
+        # Priority 1: root canonical artifacts (written by publish_canonical_from_sets).
+        # This is the expected path for any repo that ran the full pipeline.
+        # ------------------------------------------------------------------
         if (artifacts_dir / "nodefacts.json").exists():
             nf_p = artifacts_dir / "nodefacts.json"
-            # Prefer best known edge location
+
+            # Prefer root edges.json; fall back to classic/edges/full.json.
             if (artifacts_dir / "edges.json").exists():
                 e_p = artifacts_dir / "edges.json"
+            elif (artifacts_dir / "classic" / "edges" / "full.json").exists():
+                e_p = artifacts_dir / "classic" / "edges" / "full.json"
             else:
-                for ep in canonical_edge_candidates:
-                    if ep.exists():
-                        e_p = ep
-                        break
+                e_p = artifacts_dir / "edges.json"   # may not exist; handled below
+
             loaded_base = artifacts_dir
+
         else:
-            # Otherwise: look through candidate bases for nodefacts.json + an edges file
-            for base in candidates[1:]:
+            # ------------------------------------------------------------------
+            # Priority 2: per-language analyzer subdirs, in descending preference.
+            #
+            # Each entry is (base_dir, [edge_filename_candidates]).
+            # Edge candidates are tried in order; first existing file wins.
+            # Language-prefixed names (edges_go.json) are tried before the
+            # generic fallback (edges.json) so the right artifact is always used.
+            #
+            # Legacy flat dirs (ts/, go/, java/) are included for repos that were
+            # scanned before the analyzers/ prefix convention was introduced.
+            # Kotlin, Rust, and Ruby never had legacy paths.
+            # ------------------------------------------------------------------
+            lang_candidates: list = [
+                # Current convention
+                (artifacts_dir / "analyzers" / "go",
+                    ["edges_go.json", "edges.json"]),
+                (artifacts_dir / "analyzers" / "java",
+                    ["edges_java.json", "edges.json"]),
+                (artifacts_dir / "analyzers" / "kotlin",
+                    ["edges_kotlin.json", "edges.json"]),
+                (artifacts_dir / "analyzers" / "rust",
+                    ["edges_rust.json", "edges.json"]),
+                (artifacts_dir / "analyzers" / "ruby",
+                    ["edges.json"]),
+                (artifacts_dir / "analyzers" / "ts",
+                    ["edges.json"]),
+                # Legacy flat dirs
+                (artifacts_dir / "go",
+                    ["edges_go.json", "edges.json"]),
+                (artifacts_dir / "java",
+                    ["edges_java.json", "edges.json"]),
+                (artifacts_dir / "ts",
+                    ["edges.json"]),
+            ]
+
+            nf_p = artifacts_dir / "nodefacts.json"   # default; overwritten below
+            e_p = artifacts_dir / "edges.json"         # default; overwritten below
+            loaded_base = None
+
+            for base, edge_names in lang_candidates:
                 nf = base / "nodefacts.json"
                 if not nf.exists():
                     continue
 
-                # Pick the best edge file alongside it
-                e = base / "edges.json"
-                if not e.exists():
-                    # also allow classic/edges/full.json under that base
-                    alt = base / "classic" / "edges" / "full.json"
-                    if alt.exists():
-                        e = alt
+                # Find the best available edge file for this language dir.
+                e = None
+                for edge_name in edge_names:
+                    candidate = base / edge_name
+                    if candidate.exists():
+                        e = candidate
+                        break
+                # Use the preferred name even if it doesn't exist yet
+                # (safe_load_json returns {} for missing files).
+                if e is None:
+                    e = base / edge_names[-1]
 
                 nf_p = nf
                 e_p = e
                 loaded_base = base
                 break
 
+        # ------------------------------------------------------------------
+        # Load and normalise
+        # ------------------------------------------------------------------
         nf_obj = safe_load_json(nf_p) if nf_p.exists() else {}
-        e_obj = safe_load_json(e_p) if e_p.exists() else []
+        e_obj  = safe_load_json(e_p)  if e_p.exists()  else []
 
-        # nodefacts: allow either {"nodes": {...}} or raw dict/list
+        # nodefacts: accept {"nodes": {...}} or a raw dict/list
         nodes_src = nf_obj.get("nodes") if isinstance(nf_obj, dict) else nf_obj
         nodes = ensure_nodes_dict(nodes_src)
 
-        # edges: allow list, or {"edges":[...]} (java template does this)
+        # edges: accept a bare list or {"edges": [...]}
         if isinstance(e_obj, dict) and isinstance(e_obj.get("edges"), list):
-            edges_src = e_obj.get("edges")
+            edges_src = e_obj["edges"]
         else:
             edges_src = e_obj
-
         edges = edges_list(edges_src)
 
         log_event(
             "BUILDPIPE:norm_from_canonical_loaded",
-            source=str(loaded_base.relative_to(artifacts_dir)) if loaded_base else "none",
+            source=str(loaded_base.relative_to(artifacts_dir)) if loaded_base else "root",
             nf=str(nf_p.relative_to(artifacts_dir)) if nf_p.exists() else None,
             edges_path=str(e_p.relative_to(artifacts_dir)) if e_p.exists() else None,
             nodes=len(nodes),
@@ -130,8 +152,7 @@ def _norm_from_canonical(artifacts_dir: Path) -> Optional[Dict[str, Any]]:
     except Exception as e:
         log_event("BUILDPIPE:norm_from_canonical_failed", err=repr(e))
         return None
-
-
+    
 def _ensure_ctx(obj: Any, *, hook_name: str, prior_ctx: BuildContext) -> BuildContext:
     """
     Enforce that pipeline hooks return a BuildContext.
@@ -282,6 +303,8 @@ def run_analyzer_build_pipeline(
     go_files_from_manifest: List[Path] = []
     java_files_from_manifest: List[Path] = []
     kotlin_files_from_manifest: List[Path] = []
+    rust_files_from_manifest: List[Path] = []
+    ruby_files_from_manifest: List[Path] = []
 
     try:
         mp = artifacts_dir / "discovery_manifest.json"
@@ -315,6 +338,10 @@ def run_analyzer_build_pipeline(
                         java_files_from_manifest.append(p)
                     elif lang == "kotlin" or low.endswith((".kt", ".kts")):
                         kotlin_files_from_manifest.append(p)
+                    elif lang == "rust" or low.endswith(".rs"):
+                        rust_files_from_manifest.append(p)
+                    elif lang == "ruby" or low.endswith((".rb", ".rake", ".gemspec", ".ru")):
+                        ruby_files_from_manifest.append(p)
 
                 elif isinstance(r, str) and r:
                     low = r.lower()
@@ -329,6 +356,10 @@ def run_analyzer_build_pipeline(
                         java_files_from_manifest.append(p)
                     elif low.endswith((".kt", ".kts")):
                         kotlin_files_from_manifest.append(p)
+                    elif low.endswith(".rs"):
+                        rust_files_from_manifest.append(p)
+                    elif low.endswith((".rb", ".rake", ".gemspec", ".ru")):
+                        ruby_files_from_manifest.append(p)
 
             # De-dupe deterministically (stable order)
             def _uniq_paths(xs: List[Path]) -> List[Path]:
@@ -347,6 +378,8 @@ def run_analyzer_build_pipeline(
             go_files_from_manifest = _uniq_paths(go_files_from_manifest)
             java_files_from_manifest = _uniq_paths(java_files_from_manifest)
             kotlin_files_from_manifest = _uniq_paths(kotlin_files_from_manifest)
+            rust_files_from_manifest = _uniq_paths(rust_files_from_manifest)
+            ruby_files_from_manifest = _uniq_paths(ruby_files_from_manifest)
 
             # Feed python files into classic run (Python-only)
             if py_files_from_manifest:
@@ -367,6 +400,8 @@ def run_analyzer_build_pipeline(
                         "go": [p for p in go_files_from_manifest],
                         "java": [p for p in java_files_from_manifest],
                         "kotlin": [p for p in kotlin_files_from_manifest],
+                        "rust": [p for p in rust_files_from_manifest],
+                        "ruby": [p for p in ruby_files_from_manifest],
                     },
                 )
             except Exception:
@@ -379,6 +414,9 @@ def run_analyzer_build_pipeline(
                 go_files=len(go_files_from_manifest),
                 java_files=len(java_files_from_manifest),
                 kotlin_files=len(kotlin_files_from_manifest),
+                rust_files=len(rust_files_from_manifest),
+                ruby_files=len(ruby_files_from_manifest),
+
             )
 
             log_event(

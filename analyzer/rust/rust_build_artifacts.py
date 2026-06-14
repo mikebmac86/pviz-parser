@@ -13,13 +13,13 @@ Key upgrades in this revision:
     have richer fields (traits/impls/derives/attributes/type_aliases/mod_decls).
   - Edge enrichment upgraded to use the expanded model safely (derive edges,
     trait supertrait edges, impl->trait edges, and optional module declaration edges).
-  - Keeps nodefacts@v1.6 + edges@v1 compatibility (extra per-node keys are additive).
-  - Preserves raw Rust use/import specs from FileEntry.imports_all as imports_all_raw,
+  - Emits nodefacts@v1.9-compatible payloads.
+  - Preserves raw imports, unresolved external imports, and Rust-specific facts
+    through language_facts["rust"].  - Preserves raw Rust use/import specs from FileEntry.imports_all as imports_all_raw,
     separate from resolved graph imports.
 
 Schema constraints:
-  - NodeFacts: nodefacts@v1.6 compatible (nodes dict, meta)
-    - scc_id / scc_size are computed from the Rust internal dependency graph
+  - NodeFacts: nodefacts@v1.9 compatible (nodes dict, meta)    - scc_id / scc_size are computed from the Rust internal dependency graph
   - Edges: edges@v1 compatible (edges list of {src,dst,kind,confidence})
 """
 
@@ -29,7 +29,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
 import os
 
-from analyzer_store.types import FileEntry, FolderIndex
+from analyzer_store.types import FileEntry, FolderIndex, NODEFACTS_SCHEMA
 from adapters.canonical import to_posix
 
 from analyzer.rust.rust_canonical import (
@@ -174,6 +174,8 @@ def _stub_node(node_id: str) -> Dict[str, Any]:
         "lang": "rust",
         "imports": (),
         "imports_all_raw": (),
+        "imports_external": (),
+        "language_facts": {},
         "exports": (),
         "classes": (),
         "functions": (),
@@ -828,6 +830,8 @@ def build_nodefacts_from_folder_index(
                 # raw parser/folder-index use surface
                 "imports_all_raw": (),
 
+                "imports_external": (),
+                "language_facts": {},                
                 "exports": (),
                 "classes": (),
                 "functions": (),
@@ -862,6 +866,7 @@ def build_nodefacts_from_folder_index(
 
             # scratch accumulators
             by_node[node_id]["__acc_imports_all_raw"] = set()
+            by_node[node_id]["__acc_imports_external"] = set()
             for k in sym_keys:
                 by_node[node_id][f"__acc_{k}"] = set()  # type: ignore[assignment]
             for k in enrich_keys:
@@ -881,6 +886,13 @@ def build_nodefacts_from_folder_index(
                 spec = str(raw or "").strip()
                 if spec:
                     raw_acc.add(spec)
+
+        ext_acc = node.get("__acc_imports_external")
+        if isinstance(ext_acc, set):
+            for raw in (getattr(fe, "imports_external", None) or ()):
+                spec = str(raw or "").strip()
+                if spec:
+                    ext_acc.add(spec)
 
         # prefer non-empty module path
         if syms is not None:
@@ -1025,6 +1037,12 @@ def build_nodefacts_from_folder_index(
         # Raw Rust use/import specs: preserve full FolderIndex imports_all surface.
         raw_acc = node.pop("__acc_imports_all_raw", None)
         node["imports_all_raw"] = tuple(sorted(raw_acc)) if isinstance(raw_acc, set) else tuple(node.get("imports_all_raw", ()) or ())
+        ext_acc = node.pop("__acc_imports_external", None)
+        node["imports_external"] = (
+            tuple(sorted(ext_acc))
+            if isinstance(ext_acc, set)
+            else tuple(node.get("imports_external", ()) or ())
+        )
 
         node["dependencies_count"] = len(deps)
         node["importers_count"] = importers_count.get(node_id, 0)
@@ -1055,6 +1073,45 @@ def build_nodefacts_from_folder_index(
             if isinstance(acc, set) and acc:
                 node[k] = tuple(sorted(acc))
 
+        rust_facts: Dict[str, Any] = {}
+
+        if node.get("module_path"):
+            rust_facts["module_path"] = node.get("module_path")
+
+        if node.get("imports_all_raw"):
+            rust_facts["use_statements"] = list(node.get("imports_all_raw") or ())
+
+        if node.get("imports_external"):
+            rust_facts["imports_external"] = list(node.get("imports_external") or ())
+
+        if node.get("public_exports"):
+            rust_facts["public_exports"] = list(node.get("public_exports") or ())
+
+        if node.get("declared_types"):
+            rust_facts["declared_types"] = list(node.get("declared_types") or ())
+
+        if node.get("declared_types_fq"):
+            rust_facts["declared_types_fq"] = list(node.get("declared_types_fq") or ())
+
+        if node.get("annotations"):
+            rust_facts["annotations"] = list(node.get("annotations") or ())
+
+        for old_key, fact_key in (
+            ("rust_traits", "traits"),
+            ("rust_impl_traits", "impl_traits"),
+            ("rust_derives", "derives"),
+            ("rust_attributes", "attributes"),
+            ("rust_type_aliases", "type_aliases"),
+            ("rust_mod_decls", "mod_declarations"),
+        ):
+            if node.get(old_key):
+                rust_facts[fact_key] = list(node.get(old_key) or ())
+
+        if rust_facts:
+            node["language_facts"] = {
+                "rust": rust_facts,
+            }
+
     nodes = {k: by_node[k] for k in sorted(by_node.keys())}
     loc_total_all = int(sum(node_loc_total.values()))
     sloc_total_all = int(sum(node_sloc_total.values()))
@@ -1070,9 +1127,21 @@ def build_nodefacts_from_folder_index(
         len(node.get("imports_all_raw") or ())
         for node in nodes.values()
     )
+    nodes_with_external_imports = sum(
+        1 for node in nodes.values()
+        if node.get("imports_external")
+    )
+    external_import_specs_total = sum(
+        len(node.get("imports_external") or ())
+        for node in nodes.values()
+    )
+    nodes_with_language_facts = sum(
+        1 for node in nodes.values()
+        if node.get("language_facts")
+    )
 
     out = {
-        "schema_version": "nodefacts@v1.6",
+        "schema_version": NODEFACTS_SCHEMA,
         "language": "rust",
         "nodes": nodes,
         "meta": {
@@ -1093,6 +1162,9 @@ def build_nodefacts_from_folder_index(
             "nodefacts_enrichment": bool(enrich_from_cache),
             "rust_file_id_to_module": dict(file_id_to_module),
             "nodes_with_imports_all_raw": int(nodes_with_raw_imports),
+            "nodes_with_imports_external": int(nodes_with_external_imports),
+            "external_import_specs_total": int(external_import_specs_total),
+            "nodes_with_language_facts": int(nodes_with_language_facts),
             "raw_import_specs_total": int(raw_import_specs_total),
         },
     }
@@ -1101,6 +1173,8 @@ def build_nodefacts_from_folder_index(
         "RUST:nodefacts_built",
         nodes=len(nodes),
         nodes_with_imports_all_raw=int(nodes_with_raw_imports),
+        external_import_specs_total=int(external_import_specs_total),
+        nodes_with_language_facts=int(nodes_with_language_facts),
         raw_import_specs_total=int(raw_import_specs_total),
         ms=int((time.perf_counter() - t0) * 1000),
     )
@@ -1110,6 +1184,92 @@ def build_nodefacts_from_folder_index(
 # ---------------------------------------------------------------------------
 # Edge builder (from FolderIndex)
 # ---------------------------------------------------------------------------
+
+def _rust_resolved_use_specs_by_target(fe: FileEntry) -> Dict[str, Tuple[str, ...]]:
+    """
+    Return target file/module id -> use specs from FileEntry.language_facts["rust"]["resolved_uses"].
+
+    Expected resolved_uses shape:
+      {
+        "spec": "crate::foo::Bar",
+        "target": "src/foo.rs",
+        "kind": "internal",
+        "reason": "rust_use_internal:resolver",
+        "confidence": 0.8,
+      }
+
+    This avoids re-running resolve_rust_use() in the edge builder and keeps edge
+    labels aligned with the folder-index resolution pass.
+    """
+    language_facts = getattr(fe, "language_facts", {}) or {}
+    if not isinstance(language_facts, dict):
+        return {}
+
+    rust_facts = language_facts.get("rust", {}) or {}
+    if not isinstance(rust_facts, dict):
+        return {}
+
+    resolved_uses = rust_facts.get("resolved_uses", []) or ()
+    if not isinstance(resolved_uses, (list, tuple)):
+        return {}
+
+    out: Dict[str, List[str]] = {}
+
+    for rec in resolved_uses:
+        if not isinstance(rec, dict):
+            continue
+
+        kind = str(rec.get("kind", "") or "").strip()
+        if kind != "internal":
+            continue
+
+        target = to_posix(str(rec.get("target", "") or "").strip())
+        spec = str(rec.get("spec", "") or "").strip()
+
+        if not target or not spec:
+            continue
+
+        out.setdefault(target, []).append(spec)
+
+    return {
+        target: _stable_unique_strs(specs)
+        for target, specs in sorted(out.items())
+    }
+
+
+def _rust_resolved_use_reason_by_target(fe: FileEntry) -> Dict[str, str]:
+    """
+    Return target -> first recorded internal resolution reason.
+    Used only for edge metadata.
+    """
+    language_facts = getattr(fe, "language_facts", {}) or {}
+    if not isinstance(language_facts, dict):
+        return {}
+
+    rust_facts = language_facts.get("rust", {}) or {}
+    if not isinstance(rust_facts, dict):
+        return {}
+
+    resolved_uses = rust_facts.get("resolved_uses", []) or ()
+    if not isinstance(resolved_uses, (list, tuple)):
+        return {}
+
+    out: Dict[str, str] = {}
+
+    for rec in resolved_uses:
+        if not isinstance(rec, dict):
+            continue
+
+        if str(rec.get("kind", "") or "").strip() != "internal":
+            continue
+
+        target = to_posix(str(rec.get("target", "") or "").strip())
+        reason = str(rec.get("reason", "") or "").strip()
+
+        if target and reason and target not in out:
+            out[target] = reason
+
+    return out
 
 def build_edges_from_folder_index(
     idx: FolderIndex,
@@ -1164,7 +1324,16 @@ def build_edges_from_folder_index(
             return fid
         return str(file_id_to_module.get(fid, "") or "").strip()
 
-    def _add_edge(src: str, dst: str, kind: str, confidence: float) -> None:
+    def _add_edge(
+        src: str,
+        dst: str,
+        kind: str,
+        confidence: float,
+        *,
+        label: Optional[str] = None,
+        spec: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
         if not src or not dst or not kind:
             return
         if drop_self_edges and src == dst:
@@ -1173,8 +1342,20 @@ def build_edges_from_folder_index(
         if key in seen:
             return
         seen.add(key)
-        edges_out.append({"src": src, "dst": dst, "kind": kind, "confidence": float(confidence)})
-
+        edge: Dict[str, object] = {
+            "src": src,
+            "dst": dst,
+            "kind": kind,
+            "confidence": float(confidence),
+            "weight": float(confidence),
+        }
+        if label:
+            edge["label"] = label
+        if spec:
+            edge["spec"] = spec
+        if reason:
+            edge["reason"] = reason
+        edges_out.append(edge)
     # -------------------------
     # Internal edges
     # -------------------------
@@ -1185,6 +1366,9 @@ def build_edges_from_folder_index(
             if not src:
                 continue
 
+            specs_by_target = _rust_resolved_use_specs_by_target(fe)
+            reason_by_target = _rust_resolved_use_reason_by_target(fe)
+
             for dst0 in (getattr(fe, "imports_internal", None) or ()):
                 dst_file = to_posix(str(dst0 or "").strip())
                 dst = _map_node_id(dst_file)
@@ -1192,8 +1376,27 @@ def build_edges_from_folder_index(
                     continue
                 if drop_self_edges and dst == src:
                     continue
-                _add_edge(src, dst, internal_kind, 0.8)
 
+                specs = specs_by_target.get(dst_file, ())
+                label = specs[0] if specs else None
+                reason = reason_by_target.get(dst_file)
+
+                _add_edge(
+                    src,
+                    dst,
+                    internal_kind,
+                    0.8,
+                    label=label,
+                    spec=label,
+                    reason=(
+                        reason
+                        or (
+                            "rust_use_internal:resolved_uses"
+                            if label
+                            else "rust_dep_internal"
+                        )
+                    ),
+                )
     # -------------------------
     # External edges (optional)
     # -------------------------
@@ -1221,10 +1424,26 @@ def build_edges_from_folder_index(
                         kind = f"rust:use:{getattr(rr, 'kind', 'external')}"
                         dst_spec = str(getattr(rr, "spec", spec) or spec).strip()
                         dst = f"ext::{dst_spec}" if dst_spec else f"ext::{spec}"
-                        _add_edge(src, dst, kind, 0.4)
+                        _add_edge(
+                            src,
+                            dst,
+                            kind,
+                            0.4,
+                            label=dst_spec,
+                            spec=dst_spec,
+                            reason="rust_use_external_resolved",
+                        )
                 else:
                     # last-resort: keep raw spec, but namespace it to avoid collisions with module node ids
-                    _add_edge(src, f"ext::{spec}", "rust:use:external_raw", 0.2)
+                    _add_edge(
+                        src,
+                        f"ext::{spec}",
+                        "rust:use:external_raw",
+                        0.2,
+                        label=spec,
+                        spec=spec,
+                        reason="rust_use_external_raw",
+                    )
 
     # -------------------------
     # Optional enrichment edges (from parse cache)

@@ -18,6 +18,11 @@ EXT_TO_LANG: Dict[str, str] = {
     ".kt": "kotlin",
     ".kts": "kotlin",
     ".rs": "rust",
+    # Ruby source files
+    ".rb": "ruby",
+    ".rake": "ruby",
+    ".gemspec": "ruby",
+    ".ru": "ruby",
 }
 
 _CODE_EXTS = set(EXT_TO_LANG)
@@ -82,5 +87,14 @@ LANGUAGE_SPECS: Tuple[LanguageSpec, ...] = (
         nodefacts_candidates=("nodefacts.json",),
         edges_candidates=("edges_rust.json", "edges.json"),
         folder_index_candidates=("folder_index_rust.json", "folder_index.json"),
+    ),
+    LanguageSpec(
+        lang="ruby",
+        key="ruby",
+        fallback_dir="analyzers/ruby",
+        nodefacts_candidates=("nodefacts.json",),
+        # ruby_run.py writes edges_name = "edges.json" (not a language-prefixed name)
+        edges_candidates=("edges.json",),
+        folder_index_candidates=("folder_index_ruby.json", "folder_index.json"),
     ),
 )

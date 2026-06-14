@@ -77,6 +77,7 @@ def _detect_repo_packages(files_raw: Mapping[str, Any]) -> Set[str]:
     for info in files_raw.values():
         if not isinstance(info, Mapping):
             continue
+
         file_path = info.get("file", "")
         if isinstance(file_path, str) and "/" in file_path:
             top_dir = normalize_posix(file_path).split("/", 1)[0]
@@ -95,6 +96,40 @@ def _is_likely_internal(import_path: str, repo_packages: Set[str]) -> bool:
     return root in repo_packages
 
 
+def _string_list(value: Any, *, normalize_paths: bool = False) -> List[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+
+    out: List[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+
+        s = item.strip()
+        if not s:
+            continue
+
+        out.append(normalize_posix(s) if normalize_paths else s)
+
+    return dedupe_preserve_order(out)
+
+
+def _copy_mapping(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+
+    return {
+        str(k): v
+        for k, v in value.items()
+        if isinstance(k, str) and k
+    }
+
+
+def _copy_optional_bool(info: Mapping[str, Any], key: str, out: Dict[str, Any]) -> None:
+    if key in info:
+        out[key] = bool(info.get(key))
+
+
 def build_folders(folder_index: Mapping[str, Any]) -> Dict[str, Any]:
     files_raw = folder_index.get("files", {}) or {}
 
@@ -102,7 +137,7 @@ def build_folders(folder_index: Mapping[str, Any]) -> Dict[str, Any]:
         files_dict: Dict[str, Any] = {}
         for item in files_raw:
             if isinstance(item, Mapping):
-                key = item.get("file") or item.get("module_id") or item.get("id")
+                key = item.get("file") or item.get("module_id") or item.get("id") or item.get("folder_id")
                 if isinstance(key, str) and key:
                     files_dict[key] = item
         files_raw = files_dict
@@ -121,15 +156,28 @@ def build_folders(folder_index: Mapping[str, Any]) -> Dict[str, Any]:
         if not isinstance(file_path, str) or not file_path:
             continue
 
-        name = info.get("name") or (module_id.rsplit(".", 1)[-1] if isinstance(module_id, str) else "")
+        node_id = (
+            info.get("id")
+            or info.get("folder_id")
+            or module_id
+        )
+
+        name = info.get("name") or (
+            str(module_id).rsplit(".", 1)[-1]
+            if isinstance(module_id, str)
+            else ""
+        )
 
         f_entry: Dict[str, Any] = {
-            "id": module_id,
+            "id": str(node_id),
             "file": normalize_posix(file_path),
             "name": name,
             "parse_status": info.get("parse_status"),
         }
 
+        # ------------------------------------------------------------------
+        # Stable generic file metrics.
+        # ------------------------------------------------------------------
         for k in (
             "loc",
             "sloc",
@@ -143,26 +191,112 @@ def build_folders(folder_index: Mapping[str, Any]) -> Dict[str, Any]:
             if k in info and info.get(k) is not None:
                 f_entry[k] = info.get(k)
 
-        imports_internal = dedupe_preserve_order([x for x in (info.get("imports_internal") or []) if isinstance(x, str)])
-        imports_all = dedupe_preserve_order([x for x in (info.get("imports_all") or []) if isinstance(x, str)])
+        # ------------------------------------------------------------------
+        # Preserve v1.9+ canonical fields before creating the legacy projection.
+        # ------------------------------------------------------------------
+        language_facts = _copy_mapping(info.get("language_facts"))
+        if language_facts:
+            f_entry["language_facts"] = language_facts
 
-        internal_set = set(imports_internal)
-        imports_external_raw = [imp for imp in imports_all if imp not in internal_set]
+        raw_imports = _string_list(
+            info.get("imports_all_raw") or info.get("imports_all"),
+            normalize_paths=False,
+        )
+        if raw_imports:
+            f_entry["imports_all_raw"] = raw_imports
 
-        moved_internal: List[str] = []
-        imports_external: List[str] = []
-        for imp in imports_external_raw:
-            if _is_likely_internal(imp, repo_packages):
-                moved_internal.append(imp)
-            else:
-                imports_external.append(imp)
+        symbol_internal = _string_list(
+            info.get("symbol_internal"),
+            normalize_paths=True,
+        )
+        if symbol_internal:
+            f_entry["symbol_internal"] = symbol_internal
 
-        if moved_internal:
-            imports_internal = dedupe_preserve_order(imports_internal + moved_internal)
+        _copy_optional_bool(info, "eligible", f_entry)
+
+        # ------------------------------------------------------------------
+        # Preserve language-neutral symbol summaries when present.
+        #
+        # These are intentionally copied as projections, even when full
+        # language_facts also exists, because downstream bundle consumers already
+        # expect the compact top-level fields.
+        # ------------------------------------------------------------------
+        for k in (
+            "package",
+            "exports",
+            "classes",
+            "interfaces",
+            "objects",
+            "enums",
+            "functions",
+            "globals",
+            "declared_types",
+            "declared_types_fq",
+            "public_exports",
+            "annotations",
+        ):
+            if k not in info:
+                continue
+
+            val = info.get(k)
+            if isinstance(val, (list, tuple, set)):
+                cleaned = _string_list(val, normalize_paths=False)
+                if cleaned:
+                    f_entry[k] = cleaned
+            elif isinstance(val, str) and val.strip():
+                f_entry[k] = val.strip()
+
+        # ------------------------------------------------------------------
+        # Import fields.
+        #
+        # Important v1.9 rule:
+        #   imports_all_raw / imports_all = raw import specs
+        #   imports_internal              = resolved internal graph targets
+        #   imports_external              = unresolved/external specs
+        #
+        # Do not recompute external imports by subtracting internal file targets
+        # from raw specs. For Ruby, Rust, Go, Kotlin, etc., those are different
+        # namespaces.
+        # ------------------------------------------------------------------
+        imports_internal = _string_list(
+            info.get("imports_internal"),
+            normalize_paths=True,
+        )
+
+        explicit_external_raw = info.get("imports_external")
+        has_explicit_external = isinstance(explicit_external_raw, (list, tuple, set))
+
+        if has_explicit_external:
+            imports_external = _string_list(
+                explicit_external_raw,
+                normalize_paths=False,
+            )
+        else:
+            # Backward-compatible fallback for older Python/TS style indexes that
+            # did not provide imports_external.
             internal_set = set(imports_internal)
+            imports_external = [
+                imp for imp in raw_imports
+                if imp not in internal_set
+            ]
+
+            moved_internal: List[str] = []
+            kept_external: List[str] = []
+
+            for imp in imports_external:
+                if _is_likely_internal(imp, repo_packages):
+                    moved_internal.append(imp)
+                else:
+                    kept_external.append(imp)
+
+            if moved_internal:
+                imports_internal = dedupe_preserve_order(imports_internal + moved_internal)
+
+            imports_external = kept_external
 
         imports_stdlib: List[str] = []
         imports_third_party: List[str] = []
+
         for imp in imports_external:
             if _is_stdlib_import(imp):
                 imports_stdlib.append(imp)
@@ -191,7 +325,11 @@ def build_folders(folder_index: Mapping[str, Any]) -> Dict[str, Any]:
 
         style_counts = info.get("import_style_counts")
         if isinstance(style_counts, Mapping):
-            cleaned = {k: v for k, v in style_counts.items() if isinstance(k, str) and isinstance(v, int)}
+            cleaned = {
+                k: v
+                for k, v in style_counts.items()
+                if isinstance(k, str) and isinstance(v, int)
+            }
             if cleaned:
                 f_entry["import_style_counts"] = cleaned
 
@@ -216,7 +354,12 @@ def compute_import_summary(out_files: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(f_entry, Mapping):
             continue
 
-        counts = f_entry.get("import_counts", {}) if isinstance(f_entry.get("import_counts"), Mapping) else {}
+        counts = (
+            f_entry.get("import_counts", {})
+            if isinstance(f_entry.get("import_counts"), Mapping)
+            else {}
+        )
+
         total_internal += int(counts.get("internal", 0) or 0)
         total_external += int(counts.get("external", 0) or 0)
         total_stdlib += int(counts.get("stdlib", 0) or 0)
@@ -272,6 +415,7 @@ def compute_import_summary(out_files: Dict[str, Any]) -> Dict[str, Any]:
 
     return summary
 
+
 def merge_folder_indexes(
     python_idx: Optional[Mapping[str, Any]] = None,
     ts_idx: Optional[Mapping[str, Any]] = None,
@@ -279,76 +423,87 @@ def merge_folder_indexes(
     java_idx: Optional[Mapping[str, Any]] = None,
     kotlin_idx: Optional[Mapping[str, Any]] = None,
     rust_idx: Optional[Mapping[str, Any]] = None,
+    ruby_idx: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
-    Merge folder indexes from multiple language analyzers.
-    
-    Combines files and meta from Python, TypeScript, Go, Java, and Rust analyzers
-    into a unified folder index.
-    
+    Merge folder indexes from multiple language analyzers into a unified index.
+
     Args:
-        python_idx: Python folder index (optional)
-        ts_idx: TypeScript folder index (optional)
-        go_idx: Go folder index (optional)
-        java_idx: Java folder index (optional)
-        rust_idx: Rust folder index (optional)
-    
+        python_idx:  Python folder index (optional)
+        ts_idx:      TypeScript/JavaScript folder index (optional)
+        go_idx:      Go folder index (optional)
+        java_idx:    Java folder index (optional)
+        kotlin_idx:  Kotlin folder index (optional)
+        rust_idx:    Rust folder index (optional)
+        ruby_idx:    Ruby folder index (optional)
+
     Returns:
-        Merged folder index dict, or None if all inputs are None
+        Merged folder index dict, or None if all inputs are None.
     """
-    # Collect all non-None indexes
     indexes = [
         idx for idx in [
-            python_idx, ts_idx, go_idx, java_idx, kotlin_idx, rust_idx  # ADD kotlin_idx
+            python_idx,
+            ts_idx,
+            go_idx,
+            java_idx,
+            kotlin_idx,
+            rust_idx,
+            ruby_idx,
         ]
         if idx is not None
     ]
-    
+
     if not indexes:
         return None
-    
-    # If only one index, return it directly
+
     if len(indexes) == 1:
         return dict(indexes[0]) if isinstance(indexes[0], Mapping) else None
-    
-    # Merge files from all indexes
+
     merged_files: Dict[str, Any] = {}
-    
+
     for idx in indexes:
         if not isinstance(idx, Mapping):
             continue
-        
+
         files = idx.get("files")
         if isinstance(files, Mapping):
             merged_files.update(files)
-    
-    # Merge meta from all indexes
-    # Strategy: first index provides base, subsequent indexes add missing keys
+
     merged_meta: Dict[str, Any] = {}
-    
+
     for idx in indexes:
         if not isinstance(idx, Mapping):
             continue
-        
+
         meta = idx.get("meta")
         if isinstance(meta, Mapping):
             for key, val in meta.items():
                 if key not in merged_meta:
                     merged_meta[key] = val
- 
-    # Add aggregated language list to meta
+
     languages = []
+
     for idx in indexes:
-        if isinstance(idx, Mapping):
-            meta = idx.get("meta")
-            if isinstance(meta, Mapping):
-                lang = meta.get("language") or meta.get("lang")
-                if lang and lang not in languages:
-                    languages.append(str(lang))
-    
+        if not isinstance(idx, Mapping):
+            continue
+
+        meta = idx.get("meta")
+        if not isinstance(meta, Mapping):
+            continue
+
+        lang = meta.get("language") or meta.get("lang")
+        if lang and lang not in languages:
+            languages.append(str(lang))
+
+        langs = meta.get("languages")
+        if isinstance(langs, (list, tuple, set)):
+            for item in langs:
+                if item and str(item) not in languages:
+                    languages.append(str(item))
+
     if languages:
         merged_meta["languages"] = sorted(languages)
-    
+
     return {
         "schema_version": "folder_index@v1",
         "files": merged_files,

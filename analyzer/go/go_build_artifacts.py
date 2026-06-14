@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
-from analyzer_store.types import FileEntry, FolderIndex
+from analyzer_store.types import FileEntry, FolderIndex, NODEFACTS_SCHEMA
 
 from analyzer.go.go_canonical import (
     normalize_import_spec,
@@ -40,27 +40,6 @@ try:
 except Exception:  # pragma: no cover
     def log_event(*_a, **_k):
         return
-
-
-@dataclass
-class GoFileFacts:
-    """
-    Facts collected for a single Go file during NodeFacts build.
-    Not serialized; used as an intermediate step.
-    """
-    pkg_id: str
-    rel_file: str
-    parse_status: str
-    exports: Tuple[str, ...]
-    classes: Tuple[str, ...]
-    functions: Tuple[str, ...]
-    globals: Tuple[str, ...]
-    loc: Optional[int]
-    sloc: Optional[int] = None
-    comment_lines: Optional[int] = None
-    blank_lines: Optional[int] = None
-    comment_pct: Optional[float] = None
-
 
 def _stable_unique_strs(vals: Iterable[str]) -> Tuple[str, ...]:
     s: Set[str] = set()
@@ -174,6 +153,9 @@ def _stub_pkg_node(pkg_id: str) -> Dict[str, Any]:
         "language": "go",
         "lang": "go",
         "imports": (),
+        "imports_all_raw": (),
+        "imports_external": (),
+        "language_facts": {},
         "exports": (),
         "classes": (),
         "functions": (),
@@ -322,7 +304,8 @@ def build_nodefacts_from_folder_index(
     pkg_comment_lines_total: Dict[str, int] = {}
     pkg_blank_lines_total: Dict[str, int] = {}
     pkg_file_count: Dict[str, int] = {}
-
+    pkg_imports_all_raw: Dict[str, Set[str]] = {}
+    pkg_imports_external: Dict[str, Set[str]] = {}
     by_pkg: Dict[str, Dict[str, Any]] = {}
     pkg_rep_file: Dict[str, str] = {}
 
@@ -347,6 +330,18 @@ def build_nodefacts_from_folder_index(
         pkg_blank_lines_total[pkg_id] = pkg_blank_lines_total.get(pkg_id, 0) + fe_blank_lines
         pkg_file_count[pkg_id] = pkg_file_count.get(pkg_id, 0) + 1
 
+        raw_acc = pkg_imports_all_raw.setdefault(pkg_id, set())
+        for raw in (getattr(fe, "imports_all", None) or ()):
+            spec = normalize_import_spec(raw or "")
+            if spec:
+                raw_acc.add(spec)
+
+        ext_acc = pkg_imports_external.setdefault(pkg_id, set())
+        for raw in (getattr(fe, "imports_external", None) or ()):
+            spec = normalize_import_spec(raw or "")
+            if spec:
+                ext_acc.add(spec)
+
         abs_path = (repo_root / rel_file).absolute()
         syms = parse_symbols_for_nodefacts(abs_path, cfg)
 
@@ -370,6 +365,9 @@ def build_nodefacts_from_folder_index(
                 "lang": "go",
                 "imports": (),
                 "exports": (),
+                "imports_all_raw": (),
+                "imports_external": (),
+                "language_facts": {},
                 "classes": (),
                 "functions": (),
                 "globals": (),
@@ -464,6 +462,11 @@ def build_nodefacts_from_folder_index(
         comment_total = int(pkg_comment_lines_total.get(pkg_id, 0))
 
         node["imports"] = tuple(sorted(deps))
+        imports_all_raw = tuple(sorted(pkg_imports_all_raw.get(pkg_id, set())))
+        imports_external = tuple(sorted(pkg_imports_external.get(pkg_id, set())))
+
+        node["imports_all_raw"] = imports_all_raw
+        node["imports_external"] = imports_external
         node["dependencies_count"] = len(deps)
         node["importers_count"] = importers_count.get(pkg_id, 0)
 
@@ -479,15 +482,66 @@ def build_nodefacts_from_folder_index(
 
         node["file_count"] = int(pkg_file_count.get(pkg_id, 0))
 
+        go_facts: Dict[str, Any] = {
+            "package_id": pkg_id,
+        }
+
+        if mp:
+            go_facts["module_path"] = mp
+
+        if node.get("file"):
+            go_facts["representative_file"] = node.get("file")
+
+        if imports_all_raw:
+            go_facts["imports"] = list(imports_all_raw)
+
+        if imports_external:
+            go_facts["imports_external"] = list(imports_external)
+
+        if node.get("exports"):
+            go_facts["exports"] = list(node.get("exports") or ())
+
+        if node.get("classes"):
+            go_facts["classes"] = list(node.get("classes") or ())
+
+        if node.get("functions"):
+            go_facts["functions"] = list(node.get("functions") or ())
+
+        if node.get("globals"):
+            go_facts["globals"] = list(node.get("globals") or ())
+
+        node["language_facts"] = {
+            "go": go_facts,
+        }
+
     nodes = {k: by_pkg[k] for k in sorted(by_pkg.keys())}
 
     loc_total_all = int(sum(pkg_loc_total.values()))
     sloc_total_all = int(sum(pkg_sloc_total.values()))
     comment_lines_total_all = int(sum(pkg_comment_lines_total.values()))
     blank_lines_total_all = int(sum(pkg_blank_lines_total.values()))
-
+    nodes_with_raw_imports = sum(
+        1 for node in nodes.values()
+        if node.get("imports_all_raw")
+    )
+    raw_import_specs_total = sum(
+        len(node.get("imports_all_raw") or ())
+        for node in nodes.values()
+    )
+    nodes_with_external_imports = sum(
+        1 for node in nodes.values()
+        if node.get("imports_external")
+    )
+    external_import_specs_total = sum(
+        len(node.get("imports_external") or ())
+        for node in nodes.values()
+    )
+    nodes_with_language_facts = sum(
+        1 for node in nodes.values()
+        if node.get("language_facts")
+    )
     out = {
-        "schema_version": "nodefacts@v1.6",
+        "schema_version": NODEFACTS_SCHEMA,
         "language": "go",
         "nodes": nodes,
         "meta": {
@@ -497,7 +551,11 @@ def build_nodefacts_from_folder_index(
             "parse_ok": parsed_ok,
             "parse_warn": parsed_warn,
             "parse_err": parsed_err,
-
+            "nodes_with_imports_all_raw": int(nodes_with_raw_imports),
+            "raw_import_specs_total": int(raw_import_specs_total),
+            "nodes_with_imports_external": int(nodes_with_external_imports),
+            "external_import_specs_total": int(external_import_specs_total),
+            "nodes_with_language_facts": int(nodes_with_language_facts),
             "loc_total": loc_total_all,
             "sloc_total": sloc_total_all,
             "comment_lines_total": comment_lines_total_all,
@@ -516,6 +574,10 @@ def build_nodefacts_from_folder_index(
                 sloc_total=sloc_total_all,
                 comment_lines_total=comment_lines_total_all,
                 blank_lines_total=blank_lines_total_all,
+                nodes_with_imports_all_raw=int(nodes_with_raw_imports),
+                raw_import_specs_total=int(raw_import_specs_total),
+                external_import_specs_total=int(external_import_specs_total),
+                nodes_with_language_facts=int(nodes_with_language_facts),
                 ms=int((time.perf_counter() - t0) * 1000),
             )
     except Exception:
@@ -537,23 +599,55 @@ def build_edges_from_folder_index(
     edges_out: List[Dict[str, object]] = []
     seen: Set[Tuple[str, str, str]] = set()
 
+    def _add_edge(
+        src: str,
+        dst: str,
+        kind: str,
+        confidence: float,
+        *,
+        label: Optional[str] = None,
+        spec: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if not src or not dst or not kind:
+            return
+        if drop_self_edges and src == dst:
+            return
+
+        key = (src, dst, kind)
+        if key in seen:
+            return
+
+        seen.add(key)
+
+        edge: Dict[str, object] = {
+            "src": src,
+            "dst": dst,
+            "kind": kind,
+            "confidence": float(confidence),
+            "weight": float(confidence),
+        }
+        if label:
+            edge["label"] = label
+        if spec:
+            edge["spec"] = spec
+        if reason:
+            edge["reason"] = reason
+
+        edges_out.append(edge)
+
     files = getattr(idx, "files", {}) or {}
 
     if internal_only:
         pairs = build_internal_edges_from_folder_index(idx, drop_self_edges=drop_self_edges)
         for src, dst in pairs:
             kind = "go:import:internal"
-            key = (src, dst, kind)
-            if key in seen:
-                continue
-            seen.add(key)
-            edges_out.append(
-                {
-                    "src": src,
-                    "dst": dst,
-                    "kind": kind,
-                    "confidence": 0.8,
-                }
+            _add_edge(
+                src,
+                dst,
+                kind,
+                0.8,
+                reason="go_import_internal",
             )
 
     if include_external:
@@ -582,21 +676,14 @@ def build_edges_from_folder_index(
                 kind = f"go:import:{rr.kind}"
                 dst = spec
 
-                if drop_self_edges and dst == src:
-                    continue
-
-                key = (src, dst, kind)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                edges_out.append(
-                    {
-                        "src": src,
-                        "dst": dst,
-                        "kind": kind,
-                        "confidence": 0.4,
-                    }
+                _add_edge(
+                    src,
+                    dst,
+                    kind,
+                    0.4,
+                    label=spec,
+                    spec=spec,
+                    reason=f"go_import_{rr.kind}",
                 )
 
     edges_out.sort(key=lambda e: (str(e.get("kind", "")), str(e.get("src", "")), str(e.get("dst", ""))))

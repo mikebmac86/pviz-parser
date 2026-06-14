@@ -8,7 +8,8 @@ from .utils import node_files_from_nodes, node_ids_from_nodes, normalize_posix
 
 _CODE_EXTS = (
     ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs",
-    ".go", ".java", ".kt", ".kts", ".rs"
+    ".go", ".java", ".kt", ".kts", ".rs",
+    ".rb", ".rake", ".gemspec", ".ru",
 )
 
 def build_discovery(discovery_data: Mapping[str, Any], *, nodes: Mapping[str, Any]) -> Dict[str, Any]:
@@ -51,6 +52,8 @@ def build_discovery(discovery_data: Mapping[str, Any], *, nodes: Mapping[str, An
                     langs_counter["rust"] += 1
                 elif low.endswith((".kt", ".kts")):
                     langs_counter["kotlin"] += 1
+                elif low.endswith((".rb", ".rake", ".gemspec", ".ru")):
+                    langs_counter["ruby"] += 1
                 else:
                     langs_counter["other"] += 1
 
@@ -89,6 +92,8 @@ def build_discovery(discovery_data: Mapping[str, Any], *, nodes: Mapping[str, An
                     bundled_langs["rust"] += 1
                 elif low.endswith((".kt", ".kts")):
                     bundled_langs["kotlin"] += 1
+                elif low.endswith((".rb", ".rake", ".gemspec", ".ru")):
+                    bundled_langs["ruby"] += 1
                 else:
                     bundled_langs["other"] += 1
 

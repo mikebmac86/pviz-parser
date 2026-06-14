@@ -26,13 +26,24 @@ v1.8
         - scc_size_runtime
 
 v1.9
+  Added language-neutral extension support:
+    - NodeFactsNode.imports_all_raw
+    - NodeFactsNode.imports_external
+    - NodeFactsNode.language_facts
+
   Added per-node code metrics sourced from FolderIndex FileEntry:
     - sloc
     - comment_lines
     - blank_lines
     - comment_pct
-  These were previously available only as aggregates in the meta block.
-  Now populated on every node directly from the folder index at build time.
+
+  Semantics:
+    - imports remains graph-facing resolved internal dependencies.
+    - imports_all_raw preserves raw import/require/use specs.
+    - imports_external preserves unresolved external specs after internal
+      resolution.
+    - language_facts carries language-specific parser facts without expanding
+      the core schema for each language.
 
 Compatibility
 -------------
@@ -133,11 +144,16 @@ def _build_nodefacts_batch(
         - scc_size_runtime
 
     v1.9:
-      Populates per-node code metrics from FolderIndex FileEntry:
+      Per-node code metrics populated directly from FolderIndex FileEntry:
         - sloc
         - comment_lines
         - blank_lines
         - comment_pct
+
+      Language-neutral import/source-fact extensions:
+        - imports_all_raw
+        - imports_external
+        - language_facts
     """
     nodes: Dict[str, NodeFactsNode] = {}
 
@@ -260,12 +276,27 @@ def _build_nodefacts_batch(
         # Remap imports from module-id -> NodeId
         imports_ids = list(imports_node.get(nid, []))
 
+        imports_all_raw_value: Tuple[str, ...] = tuple()
+        imports_external_value: Tuple[str, ...] = tuple()
+        language_facts_value: Mapping[str, Any] = {}
+
+        if fe:
+            imports_all_raw_value = _tuple_strs(getattr(fe, "imports_all", ()) or ())
+            imports_external_value = _tuple_strs(
+                getattr(fe, "imports_external", ()) or ()
+            )
+            language_facts_value = _mapping_or_empty(
+                getattr(fe, "language_facts", {}) or {}
+            )
+
         # Base node uses stable/core schema fields.
         # scc_id / scc_size continue to represent conceptual SCC values.
         node = NodeFactsNode(
             id=nid,
             name=name,
             imports=tuple(sorted(set(imports_ids))),
+            imports_all_raw=imports_all_raw_value,
+            imports_external=imports_external_value,
             exports=tuple(exports),
             classes=tuple(classes),
             functions=tuple(functions),
@@ -287,6 +318,7 @@ def _build_nodefacts_batch(
             du=du_node.get(nid),
             dd=dd_node.get(nid),
             parse_status=parse_status,
+            language_facts=language_facts_value,
             crosstalk_candidates_py_v1=crosstalk_candidates_py_v1,
         )
 
@@ -339,7 +371,31 @@ def _loads_bytes(data: bytes) -> dict:
     except Exception:
         return {}
 
+def _tuple_strs(value: object) -> Tuple[str, ...]:
+    if value is None:
+        return tuple()
 
+    if isinstance(value, str):
+        return (value,) if value else tuple()
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return tuple(out)
+
+    s = str(value).strip()
+    return (s,) if s else tuple()
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
 # ---------------------------------------------------------------------------
 # SCC summary helper
 # ---------------------------------------------------------------------------
@@ -405,6 +461,10 @@ def build_nodefacts(
         - comment_lines
         - blank_lines
         - comment_pct
+      Populates language-neutral import/source-fact extensions from FileEntry:
+        - imports_all_raw
+        - imports_external
+        - language_facts
     """
 
     log_event("NODEFACTS:build_enter", seed_id=seed_id)
@@ -997,15 +1057,15 @@ def save_nodefacts(nf: NodeFacts, path: Path) -> None:
         - scc_size_runtime
 
     v1.9:
-      sloc, comment_lines, blank_lines, comment_pct are now dataclass fields
-      and are captured automatically by asdict().
-
-    Serializer output schema:
-      - nodefacts@v1.9
+      sloc, comment_lines, blank_lines, comment_pct, imports_all_raw,
+      imports_external, and language_facts are now dataclass fields and are
+      captured automatically by asdict().
     """
     nodes_out = {}
     tuple_fields = {
         "imports",
+        "imports_all_raw",
+        "imports_external",
         "exports",
         "classes",
         "functions",
@@ -1014,6 +1074,7 @@ def save_nodefacts(nf: NodeFacts, path: Path) -> None:
         "functions_detailed",
         "globals_detailed",
         "crosstalk_candidates_py_v1",
+        "crosstalk_candidates_ts_v1",
     }
 
     for k, v in nf.nodes.items():
@@ -1081,6 +1142,12 @@ def load_nodefacts(path: Path) -> NodeFacts:
         - blank_lines
         - comment_pct
 
+      Loads language-neutral import/source-fact extensions when present;
+      defaults to empty values for older bundles:
+        - imports_all_raw
+        - imports_external
+        - language_facts
+
     Older bundles remain valid; missing newer fields default gracefully.
     """
     data = _loads_bytes(Path(path).read_bytes())
@@ -1133,6 +1200,8 @@ def load_nodefacts(path: Path) -> NodeFacts:
             id=str(rec.get("node_id", nid)),
             name=str(rec.get("name", "")),
             imports=tuple(rec.get("imports", []) or ()),
+            imports_all_raw=_tuple_strs(rec.get("imports_all_raw", ())),
+            imports_external=_tuple_strs(rec.get("imports_external", ())),
             exports=tuple(rec.get("exports", []) or ()),
             classes=tuple(rec.get("classes", []) or ()),
             functions=tuple(rec.get("functions", []) or ()),
@@ -1155,6 +1224,7 @@ def load_nodefacts(path: Path) -> NodeFacts:
             du=rec.get("du"),
             dd=rec.get("dd"),
             parse_status=str(rec.get("parse_status", "ok")),
+            language_facts=_mapping_or_empty(rec.get("language_facts", {})),
             crosstalk_candidates_py_v1=tuple(rec.get("crosstalk_candidates_py_v1", []) or ()),
         )
 

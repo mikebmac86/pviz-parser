@@ -483,11 +483,13 @@ def build_llm_bundle_headless(
 
         python_set_dir = artifacts_root / "sets" / "classic"
         ts_set_dir = artifacts_root / "sets" / "analyzers" / "ts"
+        ruby_set_dir = artifacts_root / "analyzers" / "ruby"
 
         merge_summary = publish_canonical_from_sets(
             artifacts_root=artifacts_root,
             python_set_dir=python_set_dir,
             ts_set_dir=ts_set_dir,
+            ruby_set_dir=ruby_set_dir if ruby_set_dir.exists() else None,
             out_dir=artifacts_root,  # canonical root for exporter + zones
             merge_folder_indexes_fn=merge_folder_indexes,  # if in scope; else omit
         )

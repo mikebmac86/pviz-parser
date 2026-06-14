@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sys
+sys.path.insert(0, r"C:\Users\mbm93\Desktop\package\saas_analyzer")
+
 import json
 import argparse
 from pathlib import Path
@@ -8,7 +11,6 @@ import shutil
 from analyzer.config import AnalyzerCfg
 from core.json_export import build_llm_bundle_headless
 from core.store_root import default_store_root
-
 
 def _is_within(child: Path, parent: Path) -> bool:
     try:

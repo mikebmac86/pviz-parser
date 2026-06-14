@@ -7,7 +7,7 @@ JSONObject = Dict[str, JSON]
 JSONArray = List[JSON]
 
 ENUMS: Dict[str, List[str]] = {
-    "parse_status": ["ok", "error", "partial"],
+    "parse_status": ["ok", "error", "partial", "warn"],
     "param_kind": [
         "positional_or_keyword",
         "positional_only",
@@ -26,6 +26,7 @@ KNOWN_FIELD_ABBRS: Dict[str, str] = {
     "lang": "lg",
     "file_ext": "ext",
     "package": "pkg",
+    "package_name": "pkgn",
 
     # Metrics
     "loc": "loc",
@@ -39,6 +40,8 @@ KNOWN_FIELD_ABBRS: Dict[str, str] = {
     "dependencies_count": "dc",
     "scc_id": "sid",
     "scc_size": "ssz",
+    "scc_id_runtime": "rsid",
+    "scc_size_runtime": "rssz",
 
     # Symbol structure
     "functions": "fn",
@@ -50,21 +53,35 @@ KNOWN_FIELD_ABBRS: Dict[str, str] = {
 
     # Graph / type data
     "imports": "imp",
+    "imports_all_raw": "iar",
+    "imports_external": "iex",
+    "symbol_internal": "symi",
     "facts": "fc",
+    "language_facts": "lf",
+    "eligible": "el",
+
     "public_exports": "pex",
     "declared_types": "dt",
     "declared_types_fq": "dtq",
     "annotations": "ann",
+    "exports": "ex",
 
-    # Cross-language / Kotlin-enriched NodeFacts fields
+    # Cross-language / language-enriched NodeFacts fields
     "interfaces": "if",
     "objects": "ob",
     "enums": "en",
     "type_aliases": "ta",
-    "imports_all_raw": "iar",
-    "exports": "ex",
+    "properties": "pr",
 
-    # Crosstalk (all languages)
+    # Rust / Go / module-style fields
+    "module_path": "mp",
+    "crate_name": "cr",
+    "structs": "st",
+    "traits": "tr",
+    "impls": "im",
+    "mod_declarations": "mods",
+
+    # Crosstalk
     "crosstalk_candidates_py_v1": "ctpy",
     "crosstalk_candidates_ts_v1": "ctts",
     "crosstalk_candidates_go_v1": "ctgo",
@@ -82,8 +99,9 @@ PREFERRED_NODE_FIELDS: List[str] = [
     "file_ext",
     "module_guess",
     "package",
+    "package_name",
 
-    # Metrics (ordered for readability)
+    # Metrics
     "loc",
     "sloc",
     "comment_lines",
@@ -95,21 +113,36 @@ PREFERRED_NODE_FIELDS: List[str] = [
     "dependencies_count",
     "scc_id",
     "scc_size",
+    "scc_id_runtime",
+    "scc_size_runtime",
 
-    # Dependency / structure
+    # Dependency / graph structure
     "imports",
+    "imports_all_raw",
+    "imports_external",
+    "symbol_internal",
+
+    # Declaration / export structure
     "public_exports",
     "declared_types",
     "declared_types_fq",
     "annotations",
-
-    # Kotlin / JVM declaration fields
     "exports",
+
+    # Language-specific projected declaration fields
     "interfaces",
     "objects",
     "enums",
     "type_aliases",
-    "imports_all_raw",
+    "properties",
+
+    # Rust / module-style projected fields
+    "module_path",
+    "crate_name",
+    "structs",
+    "traits",
+    "impls",
+    "mod_declarations",
 
     # Symbol data
     "functions",
@@ -118,9 +151,13 @@ PREFERRED_NODE_FIELDS: List[str] = [
     "classes_detailed",
     "globals",
     "globals_detailed",
-    "facts",
 
-    # Crosstalk (multi-language)
+    # Rich language facts and compact generic facts
+    "language_facts",
+    "facts",
+    "eligible",
+
+    # Crosstalk
     "crosstalk_candidates_py_v1",
     "crosstalk_candidates_ts_v1",
     "crosstalk_candidates_go_v1",

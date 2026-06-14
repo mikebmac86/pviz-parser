@@ -25,6 +25,7 @@ def _load_discovery_manifest(manifest_path: Path) -> Optional[List[Dict[str, Any
         files = obj.get("files")
         if isinstance(files, list):
             return [x for x in files if isinstance(x, dict)]
+
         items = obj.get("items")
         if isinstance(items, list):
             return [x for x in items if isinstance(x, dict)]
@@ -72,7 +73,16 @@ def _bucket_manifest_files(
     *,
     scan_root: Path,
     manifest_files: Sequence[Mapping[str, Any]],
-) -> Tuple[List[Path], List[Path], List[Path], List[Path], List[Path], List[Path], Dict[str, Any]]:
+) -> Tuple[
+    List[Path],
+    List[Path],
+    List[Path],
+    List[Path],
+    List[Path],
+    List[Path],
+    List[Path],
+    Dict[str, Any],
+]:
     scan_root_resolved = scan_root.resolve(strict=False)
 
     py_files: List[Path] = []
@@ -81,6 +91,7 @@ def _bucket_manifest_files(
     java_files: List[Path] = []
     rust_files: List[Path] = []
     kotlin_files: List[Path] = []
+    ruby_files: List[Path] = []
 
     dropped_outside_root = 0
     dropped_missing_rel = 0
@@ -100,18 +111,27 @@ def _bucket_manifest_files(
             continue
 
         suf = p.suffix.lower()
-        if suf == ".py":
+        lang = str(ent.get("lang") or "").lower()
+
+        if suf == ".py" or lang == "python":
             py_files.append(p)
-        elif suf in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
+        elif suf in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs") or lang in {"ts", "js"}:
             ts_files.append(p)
-        elif suf == ".go":
+        elif suf == ".go" or lang == "go":
             go_files.append(p)
-        elif suf == ".java":
+        elif suf == ".java" or lang == "java":
             java_files.append(p)
-        elif suf == ".rs":
+        elif suf == ".rs" or lang == "rust":
             rust_files.append(p)
-        elif suf in (".kt", ".kts"):
+        elif suf in (".kt", ".kts") or lang == "kotlin":
             kotlin_files.append(p)
+        elif (
+                    suf in (".rb", ".rake", ".gemspec", ".ru")
+                    or lang == "ruby"
+                    or p.name in {"Gemfile", "Rakefile", "Capfile", "Guardfile",
+                                "Vagrantfile", "config.ru"}
+                ):
+                    ruby_files.append(p)
         else:
             skipped_non_code += 1
 
@@ -122,21 +142,29 @@ def _bucket_manifest_files(
         "java_files": len(java_files),
         "rust_files": len(rust_files),
         "kotlin_files": len(kotlin_files),
+        "ruby_files": len(ruby_files),
         "dropped_outside_root": dropped_outside_root,
         "dropped_missing_rel": dropped_missing_rel,
         "skipped_non_code": skipped_non_code,
     }
-    return py_files, ts_files, go_files, java_files, rust_files, kotlin_files, summary
+
+    return py_files, ts_files, go_files, java_files, rust_files, kotlin_files, ruby_files, summary
 
 
-def _read_lang_artifacts(lang_dir: Path) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+def _read_lang_artifacts(
+    lang_dir: Path,
+) -> Tuple[Dict[str, Dict[str, Any]], List[Dict[str, Any]], Optional[Dict[str, Any]]]:
     nodes: Dict[str, Dict[str, Any]] = {}
     edges: List[Dict[str, Any]] = []
     folder_index: Optional[Dict[str, Any]] = None
 
     nf_p = lang_dir / "nodefacts.json"
     e_p = lang_dir / "edges.json"
-    fi_p = lang_dir / "folder_index.json"
+
+    folder_index_candidates = [
+        lang_dir / "folder_index.json",
+        lang_dir / f"folder_index_{lang_dir.name}.json",
+    ]
 
     if nf_p.exists():
         try:
@@ -151,11 +179,14 @@ def _read_lang_artifacts(lang_dir: Path) -> Tuple[Dict[str, Dict[str, Any]], Lis
         except Exception as e:
             log_event("BUCKETS:read_edges_failed", path=str(e_p), err=repr(e))
 
-    if fi_p.exists():
+    for fi_p in folder_index_candidates:
+        if not fi_p.exists():
+            continue
         try:
             fi_obj = safe_load_json(fi_p)
             if isinstance(fi_obj, dict):
                 folder_index = fi_obj
+                break
         except Exception as e:
             log_event("BUCKETS:read_folder_index_failed", path=str(fi_p), err=repr(e))
 
@@ -169,8 +200,14 @@ def merge_folder_indexes(
     java_fi: Optional[Dict[str, Any]] = None,
     kotlin_fi: Optional[Dict[str, Any]] = None,
     rust_fi: Optional[Dict[str, Any]] = None,
+    ruby_fi: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
-    indexes = [fi for fi in [py_fi, ts_fi, go_fi, java_fi, kotlin_fi, rust_fi] if fi is not None]
+    indexes = [
+        fi
+        for fi in [py_fi, ts_fi, go_fi, java_fi, kotlin_fi, rust_fi, ruby_fi]
+        if fi is not None
+    ]
+
     if not indexes:
         return None
 
@@ -182,11 +219,13 @@ def merge_folder_indexes(
     def _as_dict(x: Any) -> Dict[str, Any]:
         if isinstance(x, dict):
             return dict(x)
+
         if isinstance(x, list):
             d: Dict[str, Any] = {}
             for it in x:
                 if not isinstance(it, dict):
                     continue
+
                 rid = (
                     it.get("rel_posix")
                     or it.get("path")
@@ -196,7 +235,9 @@ def merge_folder_indexes(
                 )
                 if rid:
                     d[str(rid)] = it
+
             return d
+
         return {}
 
     merged_files: Dict[str, Any] = {}
@@ -234,7 +275,11 @@ def merge_folder_indexes(
                 pass
 
             try:
-                total_errors += int(idx_meta.get("parse_issues_count", 0) or idx_meta.get("parse_err", 0) or 0)
+                total_errors += int(
+                    idx_meta.get("parse_issues_count", 0)
+                    or idx_meta.get("parse_err", 0)
+                    or 0
+                )
             except (ValueError, TypeError):
                 pass
 
@@ -270,16 +315,19 @@ def run_bucket_analyzers_default(
         try:
             if not p.exists():
                 return {"exists": False, "files": [], "count": 0}
+
             files = []
             for f in sorted(p.glob("*"))[:max_items]:
                 try:
                     files.append({"name": f.name, "size": int(f.stat().st_size)})
                 except Exception:
                     files.append({"name": f.name, "size": None})
+
             try:
                 count = sum(1 for _ in p.glob("*"))
             except Exception:
                 count = len(files)
+
             return {"exists": True, "files": files, "count": int(count)}
         except Exception as e:
             return {"exists": False, "err": repr(e), "files": [], "count": 0}
@@ -332,24 +380,31 @@ def run_bucket_analyzers_default(
     )
     t_bucket1 = time.time()
 
-    if isinstance(bucketed, tuple) and len(bucketed) == 7:
+    if isinstance(bucketed, tuple) and len(bucketed) == 8:
+        py_files, ts_files, go_files, java_files, rust_files, kotlin_files, ruby_files, bucket_summary = bucketed
+        log_event("BUCKETS:bucket_version", shape=8, kotlin_enabled=True, ruby_enabled=True)
+    elif isinstance(bucketed, tuple) and len(bucketed) == 7:
         py_files, ts_files, go_files, java_files, rust_files, kotlin_files, bucket_summary = bucketed
-        log_event("BUCKETS:bucket_version", shape=7, kotlin_enabled=True)
+        ruby_files = []
+        log_event("BUCKETS:bucket_version_compat", shape=7, ruby_defaulted=True)
     elif isinstance(bucketed, tuple) and len(bucketed) == 6:
         py_files, ts_files, go_files, java_files, rust_files, bucket_summary = bucketed
         kotlin_files = []
-        log_event("BUCKETS:bucket_version_compat", shape=6, kotlin_defaulted=True)
+        ruby_files = []
+        log_event("BUCKETS:bucket_version_compat", shape=6, kotlin_ruby_defaulted=True)
     elif isinstance(bucketed, tuple) and len(bucketed) == 5:
         py_files, ts_files, go_files, java_files, bucket_summary = bucketed
         rust_files = []
         kotlin_files = []
-        log_event("BUCKETS:bucket_version_compat", shape=5, rust_kotlin_defaulted=True)
+        ruby_files = []
+        log_event("BUCKETS:bucket_version_compat", shape=5, rust_kotlin_ruby_defaulted=True)
     elif isinstance(bucketed, tuple) and len(bucketed) == 4:
         py_files, ts_files, go_files, bucket_summary = bucketed
         java_files = []
         rust_files = []
         kotlin_files = []
-        log_event("BUCKETS:bucket_version_compat", shape=4, java_rust_kotlin_defaulted=True)
+        ruby_files = []
+        log_event("BUCKETS:bucket_version_compat", shape=4, java_rust_kotlin_ruby_defaulted=True)
     else:
         log_event(
             "BUCKETS:bucketed_unexpected_shape",
@@ -368,8 +423,10 @@ def run_bucket_analyzers_default(
         java=int(len(java_files) if java_files else 0),
         rust=int(len(rust_files) if rust_files else 0),
         kotlin=int(len(kotlin_files) if kotlin_files else 0),
+        ruby=int(len(ruby_files) if ruby_files else 0),
         rust_sample=str(rust_files[0]) if rust_files else "",
         kotlin_sample=str(kotlin_files[0]) if kotlin_files else "",
+        ruby_sample=str(ruby_files[0]) if ruby_files else "",
         java_sample=str(java_files[0]) if java_files else "",
         go_sample=str(go_files[0]) if go_files else "",
         ts_sample=str(ts_files[0]) if ts_files else "",
@@ -391,6 +448,9 @@ def run_bucket_analyzers_default(
 
     kotlin_out = analyzers_root / "kotlin"
     kotlin_out.mkdir(parents=True, exist_ok=True)
+
+    ruby_out = analyzers_root / "ruby"
+    ruby_out.mkdir(parents=True, exist_ok=True)
 
     def _default_goextract_bin(scan_root: Path) -> Optional[Path]:
         candidates = [
@@ -417,6 +477,7 @@ def run_bucket_analyzers_default(
         java_out=str(java_out),
         rust_out=str(rust_out),
         kotlin_out=str(kotlin_out),
+        ruby_out=str(ruby_out),
         analyzers_root_listing=_list_dir(analyzers_root, max_items=30),
     )
 
@@ -906,6 +967,96 @@ def run_bucket_analyzers_default(
     else:
         log_event("BUCKETS:kotlin_skipped", reason="no_kotlin_files", out=str(kotlin_out))
 
+    ruby_ok = False
+    if ruby_files:
+        t_ruby0 = time.time()
+        try:
+            from analyzer.ruby.ruby_run import analyze_files_ruby  # type: ignore
+            from analyzer.ruby.ruby_config import RubyAnalyzerCfg  # type: ignore
+
+            if isinstance(cfg_like, RubyAnalyzerCfg):
+                ruby_cfg = cfg_like
+            else:
+                defaults = RubyAnalyzerCfg()
+                base = cfg_like
+                ruby_cfg = RubyAnalyzerCfg(
+                    max_file_bytes=getattr(
+                        base,
+                        "max_file_bytes",
+                        getattr(base, "max_bytes_per_file", defaults.max_file_bytes),
+                    ),
+                    max_bytes_per_file=getattr(
+                        base,
+                        "max_bytes_per_file",
+                        getattr(base, "max_file_bytes", defaults.max_bytes_per_file),
+                    ),
+                    include_tests=getattr(base, "include_tests", defaults.include_tests),
+                    include_generated=getattr(base, "include_generated", defaults.include_generated),
+                    rubyparser_cli_path=getattr(base, "rubyparser_cli_path", defaults.rubyparser_cli_path),
+                    rubyparser_timeout_s=getattr(base, "rubyparser_timeout_s", defaults.rubyparser_timeout_s),
+                    rails_mode=getattr(base, "rails_mode", defaults.rails_mode),
+                    ruby_include_external_edges=getattr(
+                        base, "ruby_include_external_edges",
+                        getattr(base, "emit_external_edges", defaults.ruby_include_external_edges),
+                    ),
+                    nodefacts_name=getattr(base, "nodefacts_name", defaults.nodefacts_name),
+                    edges_name=getattr(base, "edges_name", defaults.edges_name),
+                    folder_index_name=getattr(base, "folder_index_name", defaults.folder_index_name),
+                    include_globs=getattr(base, "include_globs", defaults.include_globs),
+                    exclude_globs=getattr(base, "exclude_globs", defaults.exclude_globs),
+                )
+
+            log_event(
+                "BUCKETS:ruby_start",
+                out=str(ruby_out),
+                files=int(len(ruby_files)),
+                cfg={
+                    "max_file_bytes": getattr(ruby_cfg, "max_file_bytes", None),
+                    "max_bytes_per_file": getattr(ruby_cfg, "max_bytes_per_file", None),
+                    "include_tests": getattr(ruby_cfg, "include_tests", None),
+                    "include_generated": getattr(ruby_cfg, "include_generated", None),
+                    "ruby_include_external_edges": getattr(ruby_cfg, "ruby_include_external_edges", None),
+                    "rubyparser_cli_path": str(getattr(ruby_cfg, "rubyparser_cli_path", "") or ""),
+                    "rubyparser_timeout_s": getattr(ruby_cfg, "rubyparser_timeout_s", None),
+                    "rails_mode": getattr(ruby_cfg, "rails_mode", None),
+                    "nodefacts_name": getattr(ruby_cfg, "nodefacts_name", None),
+                    "edges_name": getattr(ruby_cfg, "edges_name", None),
+                    "folder_index_name": getattr(ruby_cfg, "folder_index_name", None),
+                },
+                sample=str(ruby_files[0]) if ruby_files else "",
+            )
+
+            frag = analyze_files_ruby(
+                repo_root=scan_root,
+                artifact_dir=ruby_out,
+                cfg=ruby_cfg,
+                files=ruby_files,
+                folder_index_name=getattr(ruby_cfg, "folder_index_name", "folder_index_ruby.json"),
+                build_edges=True,
+                write_nodefacts=True,
+            )
+
+            ruby_ok = True
+            log_event(
+                "BUCKETS:ruby_done",
+                out=str(ruby_out),
+                files=len(ruby_files),
+                elapsed_ms=int((time.time() - t_ruby0) * 1000),
+                nodes=(len(frag.get("nodes") or {}) if isinstance(frag, dict) else 0),
+                edges=(len(frag.get("edges") or []) if isinstance(frag, dict) else 0),
+                out_listing=_list_dir(ruby_out, max_items=30),
+            )
+        except Exception as e:
+            log_event(
+                "BUCKETS:ruby_failed",
+                err=repr(e),
+                files=len(ruby_files),
+                elapsed_ms=int((time.time() - t_ruby0) * 1000),
+                out_listing=_list_dir(ruby_out, max_items=20),
+            )
+    else:
+        log_event("BUCKETS:ruby_skipped", reason="no_ruby_files", out=str(ruby_out))
+
     log_event(
         "BUCKETS:end",
         elapsed_ms=int((time.time() - t0) * 1000),
@@ -914,18 +1065,20 @@ def run_bucket_analyzers_default(
         java_ok=bool(java_ok),
         rust_ok=bool(rust_ok),
         kotlin_ok=bool(kotlin_ok),
+        ruby_ok=bool(ruby_ok),
         ts_out_listing=_list_dir(ts_out, max_items=15),
         go_out_listing=_list_dir(go_out, max_items=15),
         java_out_listing=_list_dir(java_out, max_items=15),
         rust_out_listing=_list_dir(rust_out, max_items=15),
         kotlin_out_listing=_list_dir(kotlin_out, max_items=15),
+        ruby_out_listing=_list_dir(ruby_out, max_items=15),
     )
 
     return {
         "meta": {
             "scan_root": str(scan_root),
             "store_root": str(store_root),
-            "mode": "bucket_analyzers_default_ts_go_java_rust_kotlin",
+            "mode": "bucket_analyzers_default_ts_go_java_rust_kotlin_ruby",
             "bucket_summary": bucket_summary,
 
             "ts_out": str(ts_out),
@@ -947,6 +1100,10 @@ def run_bucket_analyzers_default(
             "kotlin_out": str(kotlin_out),
             "kotlin_ok": bool(kotlin_ok),
             "kotlin_files": int(len(kotlin_files) if kotlin_files else 0),
+
+            "ruby_out": str(ruby_out),
+            "ruby_ok": bool(ruby_ok),
+            "ruby_files": int(len(ruby_files) if ruby_files else 0),
 
             "py_files": int(len(py_files) if py_files else 0),
         },

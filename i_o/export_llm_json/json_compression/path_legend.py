@@ -5,6 +5,42 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from .util import schema_fields, find_field_indices
 
+PATH_ELIGIBLE_KEYS: Set[str] = {
+    "src",
+    "dst",
+    "file",
+    "node_id",
+    "imports",
+    "imports_internal",
+    "imports_runtime",
+    "imports_runtime_internal",
+    "symbol_internal",
+    "target",
+    "source",
+    "owner_file",
+    "provider_file",
+    "provider_files",
+    "resolved_target",
+    "resolved_file",
+}
+
+SKIP_RECURSE_KEYS: Set[str] = {
+    "path_legend",
+}
+
+SEMANTIC_FACT_KEYS: Set[str] = {
+    "spec",
+    "label",
+    "reason",
+    "fq_name",
+    "name",
+    "owner",
+    "kind",
+    "visibility",
+    "raw",
+    "call_form",
+    "receiver",
+}
 
 def is_repo_relative_posix_path(p: str) -> bool:
     # Strict-ish guardrails so the legend stays "repo-internal"
@@ -130,28 +166,64 @@ def rewrite_nodes_rows_with_path_ids(nodes: Dict[str, Any], path_to_id: Dict[str
     nodes["row_ids"] = row_ids
     nodes["rows"] = new_rows
 
-
-def encode_paths_globally(obj: Any, *, path_to_id: Dict[str, int], skip_keys: Set[str]) -> Any:
+def encode_paths_globally(
+    obj: Any,
+    *,
+    path_to_id: Dict[str, int],
+    skip_keys: Set[str],
+    parent_key: Optional[str] = None,
+    inside_language_facts: bool = False,
+) -> Any:
     if isinstance(obj, str):
+        # Inside language_facts, only encode strings under known path-bearing keys.
+        if inside_language_facts:
+            if parent_key not in PATH_ELIGIBLE_KEYS:
+                return obj
+        else:
+            # Outside language_facts, preserve the previous global behavior,
+            # except for explicitly semantic fields.
+            if parent_key in SEMANTIC_FACT_KEYS:
+                return obj
+
         pid = path_to_id.get(obj)
         if pid is not None:
             return -(pid + 1)
+
         return obj
 
     if isinstance(obj, list):
-        return [encode_paths_globally(v, path_to_id=path_to_id, skip_keys=skip_keys) for v in obj]
+        return [
+            encode_paths_globally(
+                value,
+                path_to_id=path_to_id,
+                skip_keys=skip_keys,
+                parent_key=parent_key,
+                inside_language_facts=inside_language_facts,
+            )
+            for value in obj
+        ]
 
     if isinstance(obj, dict):
         out: Dict[str, Any] = {}
-        for kk, vv in obj.items():
-            if kk in skip_keys:
-                out[kk] = vv
-            else:
-                out[kk] = encode_paths_globally(vv, path_to_id=path_to_id, skip_keys=skip_keys)
+
+        for key, value in obj.items():
+            if key in skip_keys:
+                out[key] = value
+                continue
+
+            key_s = str(key)
+
+            out[key_s] = encode_paths_globally(
+                value,
+                path_to_id=path_to_id,
+                skip_keys=skip_keys,
+                parent_key=key_s,
+                inside_language_facts=inside_language_facts or key_s == "language_facts",
+            )
+
         return out
 
     return obj
-
 
 def apply_path_legend_global_inplace(compressed: Dict[str, Any]) -> None:
     """
@@ -179,11 +251,18 @@ def apply_path_legend_global_inplace(compressed: Dict[str, Any]) -> None:
     rewrite_nodes_rows_with_path_ids(nodes, path_to_id)
 
     skip_keys = {"path_legend"}
-    for top_k in list(compressed.keys()):
-        if top_k in skip_keys:
-            continue
-        compressed[top_k] = encode_paths_globally(compressed[top_k], path_to_id=path_to_id, skip_keys=skip_keys)
 
+    for top_key in list(compressed.keys()):
+        if top_key in skip_keys:
+            continue
+
+        compressed[top_key] = encode_paths_globally(
+            compressed[top_key],
+            path_to_id=path_to_id,
+            skip_keys=skip_keys,
+            parent_key=top_key,
+            inside_language_facts=False,
+        )
 
 def decode_path_id(path_legend: Dict[str, Any], path_id: int) -> Optional[str]:
     prefixes = path_legend.get("prefixes")

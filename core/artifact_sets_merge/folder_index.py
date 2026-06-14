@@ -95,6 +95,7 @@ def merge_folder_indexes(
                 java_fi=folder_indexes_by_lang.get("java"),
                 kotlin_fi=folder_indexes_by_lang.get("kotlin"),
                 rust_fi=folder_indexes_by_lang.get("rust"),
+                ruby_fi=folder_indexes_by_lang.get("ruby"),
             )
         except TypeError:
             merged_fi = None

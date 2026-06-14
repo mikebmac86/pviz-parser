@@ -5,7 +5,10 @@ FolderIndex — deterministic snapshot of a workspace's Python files.
 
 This module consumes the existing analyzer primitives (fs, parse, imports_lex,
 module_resolve, module_map) and emits a JSON-ready structure conforming to the
-schema "folder-index-1.0.0" defined in analyzer_store.types.
+schema defined in analyzer_store.types.
+
+Current schema:
+  - folder-index-1.2.0
 
 Public API
 ----------
@@ -16,7 +19,8 @@ load_folder_index(path: Path) -> FolderIndex
 Notes
 -----
 • Deterministic: stable sorting, deduped lists, positional-agnostic IDs.
-• Internal edges use ModuleMap to decide if a target module belongs to the folder.
+• Internal edges use the normalized module-id space to decide if a target module
+  belongs to the folder.
 • Error tolerant: parse_status captures failures; facts may be partial.
 • Atomic writes via analyzer_store.io_utils.atomic_write_json.
 • IMPORTANT: The per-file key and FileEntry.id are **module ids relative to the
@@ -27,6 +31,14 @@ Notes
   few or no internal edges. For full graph connectivity, prefer scanning from
   the package root ('scrapy') or repo root.
 
+v1.9 compatibility notes
+------------------------
+• FileEntry.imports_all preserves raw import/module targets seen by the analyzer.
+• FileEntry.imports_internal contains resolved internal module/file targets.
+• FileEntry.imports_external contains unresolved external specs after internal
+  resolution.
+• FileEntry.language_facts is preserved when present, but the Python folder index
+  does not currently populate Python-specific language facts here.
 """
 
 from dataclasses import asdict
@@ -155,6 +167,44 @@ def count_python_metrics(text: str):
 
     comment_pct = (comment_lines / loc) if loc else None
     return loc, sloc, comment_lines, blank_lines, comment_pct
+
+def _tuple_strs(value: object) -> Tuple[str, ...]:
+    """
+    Normalize a JSON-loaded sequence into a deterministic tuple[str, ...].
+
+    This is intentionally tolerant because older folder-index artifacts may have
+    missing fields, nulls, lists, tuples, or occasional scalar values.
+    """
+    if value is None:
+        return tuple()
+
+    if isinstance(value, str):
+        return (value,) if value else tuple()
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out = []
+        for item in value:
+            if item is None:
+                continue
+            s = str(item)
+            if s:
+                out.append(s)
+        return tuple(out)
+
+    s = str(value)
+    return (s,) if s else tuple()
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    """
+    Normalize a JSON-loaded mapping-ish value.
+
+    The dataclass type is Mapping, so returning a plain dict is fine and keeps
+    the object JSON-friendly.
+    """
+    if isinstance(value, dict):
+        return value
+    return {}
 
 # ---------------------------------------------------------------------------
 # TC line-range collector (used by _expand_imports_ast runtime_only mode)
@@ -397,6 +447,9 @@ def _build_folder_index_batch(
             mtime=mtime_iso,
             hash=short_hash,
             import_style_counts=style_counts,
+            symbol_internal=tuple(),
+            imports_external=tuple(),      # computed after normalized resolution
+            language_facts={},             # Python-specific facts can be added later
             error_snippet=err_snip,
             eligible=eligible,
         )
@@ -688,8 +741,8 @@ def build_folder_index(root: Path, cfg: a_config.AnalyzerCfg) -> FolderIndex:
                 parse_status=fe.parse_status,
                 imports_all=fe.imports_all,
                 imports_internal=fe.imports_internal,
-                imports_runtime=fe.imports_runtime,              
-                imports_runtime_internal=fe.imports_runtime_internal,  
+                imports_runtime=fe.imports_runtime,
+                imports_runtime_internal=fe.imports_runtime_internal,
                 loc=fe.loc,
                 sloc=fe.sloc,
                 comment_lines=fe.comment_lines,
@@ -699,6 +752,9 @@ def build_folder_index(root: Path, cfg: a_config.AnalyzerCfg) -> FolderIndex:
                 mtime=fe.mtime,
                 hash=fe.hash,
                 import_style_counts=fe.import_style_counts,
+                symbol_internal=fe.symbol_internal,
+                imports_external=fe.imports_external,
+                language_facts=fe.language_facts,
                 error_snippet=fe.error_snippet,
                 eligible=fe.eligible,
             )
@@ -738,27 +794,38 @@ def build_folder_index(root: Path, cfg: a_config.AnalyzerCfg) -> FolderIndex:
 
     files3: Dict[str, FileEntry] = {}
     for mod_id, fe in list(files.items()):
-        # Existing: all imports -> internal
+        # imports_all -> resolved internal targets + unresolved external specs
         all_mods = list(fe.imports_all or ())
         mapped: List[str] = []
+        external: List[str] = []
+
         for m in all_mods:
             ci = _closest_internal(m)
             if ci is not None:
                 mapped.append(ci)
+            else:
+                external.append(m)
+
         internal_mods = tuple(sorted(set(mapped)))
+        external_mods = tuple(sorted(set(external)))
+
+        # imports_runtime -> resolved runtime internal targets
         runtime_mods_raw = list(fe.imports_runtime or ())
         runtime_mapped: List[str] = []
+
         for m in runtime_mods_raw:
             ci = _closest_internal(m)
             if ci is not None:
                 runtime_mapped.append(ci)
+
         runtime_internal_mods = tuple(sorted(set(runtime_mapped)))
 
-        # Only reconstruct if something changed
         unchanged = (
             internal_mods == fe.imports_internal
             and runtime_internal_mods == fe.imports_runtime_internal
+            and external_mods == fe.imports_external
         )
+
         if unchanged:
             files3[mod_id] = fe
         else:
@@ -769,8 +836,8 @@ def build_folder_index(root: Path, cfg: a_config.AnalyzerCfg) -> FolderIndex:
                 parse_status=fe.parse_status,
                 imports_all=fe.imports_all,
                 imports_internal=internal_mods,
-                imports_runtime=fe.imports_runtime,  
-                imports_runtime_internal=runtime_internal_mods,  
+                imports_runtime=fe.imports_runtime,
+                imports_runtime_internal=runtime_internal_mods,
                 loc=fe.loc,
                 sloc=fe.sloc,
                 comment_lines=fe.comment_lines,
@@ -780,6 +847,9 @@ def build_folder_index(root: Path, cfg: a_config.AnalyzerCfg) -> FolderIndex:
                 mtime=fe.mtime,
                 hash=fe.hash,
                 import_style_counts=fe.import_style_counts,
+                symbol_internal=fe.symbol_internal,
+                imports_external=external_mods,
+                language_facts=fe.language_facts,
                 error_snippet=fe.error_snippet,
                 eligible=fe.eligible,
             )
@@ -832,10 +902,12 @@ def build_folder_index(root: Path, cfg: a_config.AnalyzerCfg) -> FolderIndex:
 
 def save_folder_index(idx: FolderIndex, path: Path) -> None:
     """
-    Serialize the FolderIndex using the new folder_id schema only.
+    Serialize the FolderIndex using the folder_id schema only.
     Drops legacy 'id' key to eliminate ambiguity.
 
     v1.1: Serializes imports_runtime and imports_runtime_internal.
+    v1.2/v1.9-compatible: Serializes imports_external and language_facts when
+    present on FileEntry.
     """
     files_payload: Dict[str, dict] = {}
     for k, v in idx.files.items():
@@ -856,10 +928,15 @@ def load_folder_index(path: Path) -> FolderIndex:
     """
     Load FolderIndex strictly using folder_id.
     Fails fast if legacy 'id' keys are still present to ensure clean migration.
-    (Uses tolerant bytes loader: orjson fast-path, UTF-8 fallback.)
+    Uses tolerant bytes loader: orjson fast-path, UTF-8 fallback.
 
-    v1.1: Loads imports_runtime and imports_runtime_internal with graceful
-    defaults (empty tuple) for backward compatibility with v1.0 indexes.
+    v1.1:
+      Loads imports_runtime and imports_runtime_internal with graceful defaults
+      for backward compatibility with v1.0 indexes.
+
+    v1.2/v1.9-compatible:
+      Loads imports_external, symbol_internal, and language_facts with graceful
+      defaults for older indexes.
     """
     data = load_json_bytes(Path(path))
     if not isinstance(data, dict) or not data:
@@ -881,8 +958,8 @@ def load_folder_index(path: Path) -> FolderIndex:
 
         is_placeholder = (
             isinstance(meta_val, dict)
-            and isinstance(files_val, list)   # placeholder uses list, not mapping
-            and isinstance(folders_val, list) # placeholder uses list, not mapping
+            and isinstance(files_val, list)
+            and isinstance(folders_val, list)
         )
         if is_placeholder:
             raise ValueError(
@@ -910,22 +987,33 @@ def load_folder_index(path: Path) -> FolderIndex:
             file=str(rec["file"]),
             name=str(rec["name"]),
             parse_status=str(rec.get("parse_status", "ok")),
-            imports_all=tuple(rec.get("imports_all", []) or ()),
-            imports_internal=tuple(rec.get("imports_internal", []) or ()),
-            imports_runtime=tuple(rec.get("imports_runtime", []) or ()),  
-            imports_runtime_internal=tuple(rec.get("imports_runtime_internal", []) or ()),
-            loc=rec.get("loc"),
-            sloc=rec.get("sloc"),
-            comment_lines=rec.get("comment_lines"),
-            blank_lines=rec.get("blank_lines"),
-            comment_pct=rec.get("comment_pct"),
-            size_bytes=rec.get("size_bytes"),
-            mtime=rec.get("mtime"),
-            hash=rec.get("hash"),
-            import_style_counts=rec.get("import_style_counts", {}),
-            error_snippet=rec.get("error_snippet"),
-            eligible=rec.get("eligible", True),
+
+            imports_all=_tuple_strs(rec.get("imports_all", ())),
+            imports_internal=_tuple_strs(rec.get("imports_internal", ())),
+            imports_runtime=_tuple_strs(rec.get("imports_runtime", ())),
+            imports_runtime_internal=_tuple_strs(
+                rec.get("imports_runtime_internal", ())
+            ),
+
+            loc=rec.get("loc"),  # type: ignore[arg-type]
+            sloc=rec.get("sloc"),  # type: ignore[arg-type]
+            comment_lines=rec.get("comment_lines"),  # type: ignore[arg-type]
+            blank_lines=rec.get("blank_lines"),  # type: ignore[arg-type]
+            comment_pct=rec.get("comment_pct"),  # type: ignore[arg-type]
+
+            size_bytes=rec.get("size_bytes"),  # type: ignore[arg-type]
+            mtime=rec.get("mtime"),  # type: ignore[arg-type]
+            hash=rec.get("hash"),  # type: ignore[arg-type]
+            import_style_counts=_mapping_or_empty(
+                rec.get("import_style_counts", {})
+            ),  # type: ignore[arg-type]
+
+            symbol_internal=_tuple_strs(rec.get("symbol_internal", ())),
+            imports_external=_tuple_strs(rec.get("imports_external", ())),
+            language_facts=_mapping_or_empty(rec.get("language_facts", {})),
+
+            error_snippet=rec.get("error_snippet"),  # type: ignore[arg-type]
+            eligible=bool(rec.get("eligible", True)),
         )
 
     return FolderIndex(schema=data["schema"], meta=data.get("meta", {}), files=files)
-

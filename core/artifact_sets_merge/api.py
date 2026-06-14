@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict, Optional
-
+import shutil
 from .scc import inject_scc_fields_from_edges
 from .config import LANGUAGE_SPECS
 from .crosstalk import generate_crosstalk_edges
@@ -32,6 +32,7 @@ def publish_canonical_from_sets(
     java_set_dir: Optional[Path] = None,
     kotlin_set_dir: Optional[Path] = None,
     rust_set_dir: Optional[Path] = None,
+    ruby_set_dir: Optional[Path] = None,
     out_dir: Optional[Path] = None,
     merge_folder_indexes_fn: Optional[Any] = None,
     persist_folder_index: bool = False,
@@ -48,6 +49,7 @@ def publish_canonical_from_sets(
         "java": resolve_optional_dir(java_set_dir),
         "kotlin": resolve_optional_dir(kotlin_set_dir),
         "rust": resolve_optional_dir(rust_set_dir),
+        "ruby": resolve_optional_dir(ruby_set_dir),
     }
 
     discovered = discover_language_inputs(
@@ -141,6 +143,16 @@ def publish_canonical_from_sets(
         persist_reachable=persist_reachable,
     )
 
+    # After publish_artifacts call, add:
+    ruby_sd = set_dirs.get("ruby")
+    if ruby_sd and Path(ruby_sd).exists():
+        src = Path(ruby_sd) / "ruby_analysis_indexes.json"
+        if src.exists():
+            try:
+                shutil.copy2(src, out_dir / "ruby_analysis_indexes.json")
+            except Exception:
+                pass
+
     inputs = build_inputs_report(discovered=discovered, specs=LANGUAGE_SPECS)
     counts = build_counts_report(
         nodes_by_lang=nodes_by_lang,
@@ -162,6 +174,7 @@ def publish_canonical_from_sets(
         "java_set_dir": str(set_dirs["java"]) if set_dirs["java"] else None,
         "kotlin_set_dir": str(set_dirs["kotlin"]) if set_dirs["kotlin"] else None,
         "rust_set_dir": str(set_dirs["rust"]) if set_dirs["rust"] else None,
+        "ruby_set_dir": str(set_dirs["ruby"]) if set_dirs["ruby"] else None,
         "options": {
             "persist_folder_index": bool(persist_folder_index),
             "persist_reachable": bool(persist_reachable),

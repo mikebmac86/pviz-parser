@@ -644,6 +644,15 @@ def build_summary(
         sm = {k: meta.get(k) for k in ("repo_name", "mode", "generated_at") if k in meta}
         sm["language"] = derived_language
         sm["languages"] = langs
+
+        # Rails detection — propagate from Ruby analyzer meta if present
+        rails_raw = meta.get("rails_detected")
+        if rails_raw is not None:
+            if isinstance(rails_raw, bool):
+                sm["rails_detected"] = rails_raw
+            elif isinstance(rails_raw, str):
+                sm["rails_detected"] = rails_raw.lower() == "true"
+
         summary["meta"] = sm
 
     return summary

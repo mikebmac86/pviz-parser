@@ -26,7 +26,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import time
 import os
 
-from analyzer_store.types import FileEntry, FolderIndex
+from analyzer_store.types import FileEntry, FolderIndex, NODEFACTS_SCHEMA
 from adapters.canonical import to_posix
 
 from analyzer.java.java_canonical import (
@@ -215,6 +215,7 @@ def _stub_node(node_id: str) -> Dict[str, Any]:
         "annotations": (),
         "imports_all_raw": (),
         "imports_external": (),
+        "language_facts": {},
     }
 
 
@@ -712,6 +713,7 @@ def build_nodefacts_from_folder_index(
                 "annotations": (),
                 "imports_all_raw": (),
                 "imports_external": (),
+                "language_facts": {},
 
                 # housekeeping / metrics
                 "gen_seq": 0,
@@ -770,6 +772,19 @@ def build_nodefacts_from_folder_index(
                                 acc.add(vv)
                 except Exception:
                     pass
+        raw_acc = node.get("__acc_imports_all_raw")
+        if isinstance(raw_acc, set):
+            for raw in (getattr(fe, "imports_all", None) or ()):
+                spec = str(raw or "").strip()
+                if spec:
+                    raw_acc.add(spec)
+
+        ext_acc = node.get("__acc_imports_external")
+        if isinstance(ext_acc, set):
+            for raw in (getattr(fe, "imports_external", None) or ()):
+                spec = str(raw or "").strip()
+                if spec:
+                    ext_acc.add(spec)
 
     # ---------------------------------------------------------------------
     # PASS B: deps/importers from imports_internal (file-id space)
@@ -848,6 +863,35 @@ def build_nodefacts_from_folder_index(
                 # keep existing (stubs already have tuples)
                 node[k] = tuple(node.get(k, ()) or ())
 
+        java_facts: Dict[str, Any] = {}
+
+        if node.get("package"):
+            java_facts["package"] = node.get("package")
+
+        if node.get("imports_all_raw"):
+            java_facts["imports"] = list(node.get("imports_all_raw") or ())
+
+        if node.get("imports_external"):
+            java_facts["imports_external"] = list(node.get("imports_external") or ())
+
+        for old_key, fact_key in (
+            ("classes", "classes"),
+            ("functions", "functions"),
+            ("globals", "globals"),
+            ("annotations", "annotations"),
+            ("declared_types", "declared_types"),
+            ("declared_types_fq", "declared_types_fq"),
+            ("public_exports", "public_exports"),
+            ("exports", "exports"),
+        ):
+            if node.get(old_key):
+                java_facts[fact_key] = list(node.get(old_key) or ())
+
+        if java_facts:
+            node["language_facts"] = {
+                "java": java_facts,
+            }
+
     nodes = {k: by_node[k] for k in sorted(by_node.keys())}
 
     loc_total_all = int(sum(node_loc_total.values()))
@@ -855,8 +899,29 @@ def build_nodefacts_from_folder_index(
     comment_lines_total_all = int(sum(node_comment_lines_total.values()))
     blank_lines_total_all = int(sum(node_blank_lines_total.values()))
 
+    nodes_with_raw_imports = sum(
+        1 for node in nodes.values()
+        if node.get("imports_all_raw")
+    )
+    raw_import_specs_total = sum(
+        len(node.get("imports_all_raw") or ())
+        for node in nodes.values()
+    )
+    nodes_with_external_imports = sum(
+        1 for node in nodes.values()
+        if node.get("imports_external")
+    )
+    external_import_specs_total = sum(
+        len(node.get("imports_external") or ())
+        for node in nodes.values()
+    )
+    nodes_with_language_facts = sum(
+        1 for node in nodes.values()
+        if node.get("language_facts")
+    )
+
     out = {
-        "schema_version": "nodefacts@v1.6",
+        "schema_version": NODEFACTS_SCHEMA,
         "language": "java",
         "nodes": nodes,
         "meta": {
@@ -873,13 +938,26 @@ def build_nodefacts_from_folder_index(
             "comment_pct": _comment_pct(comment_lines_total_all, loc_total_all),
             "java_node_id_space": node_id_space,
             "java_nodefacts_symbols": symbols_mode,
+            "nodes_with_imports_all_raw": int(nodes_with_raw_imports),
+            "raw_import_specs_total": int(raw_import_specs_total),
+            "nodes_with_imports_external": int(nodes_with_external_imports),
+            "external_import_specs_total": int(external_import_specs_total),
+            "nodes_with_language_facts": int(nodes_with_language_facts),
             "used_parse_cache": bool(isinstance(parse_cache, dict) and parse_cache),
             # publish mapping for downstream consumers (pipeline can reuse directly)
             "java_file_id_to_package": dict(file_id_to_package),
         },
     }
 
-    log_event("JAVA:nodefacts_built", nodes=len(nodes), ms=int((time.perf_counter() - t0) * 1000))
+    log_event(
+        "JAVA:nodefacts_built",
+        nodes=len(nodes),
+        nodes_with_imports_all_raw=int(nodes_with_raw_imports),
+        raw_import_specs_total=int(raw_import_specs_total),
+        external_import_specs_total=int(external_import_specs_total),
+        nodes_with_language_facts=int(nodes_with_language_facts),
+        ms=int((time.perf_counter() - t0) * 1000),
+    )
     return out
 
 
@@ -925,6 +1003,43 @@ def build_edges_from_folder_index(
     edges_out: List[Dict[str, object]] = []
     seen: Set[Tuple[str, str, str]] = set()
 
+    def _add_edge(
+        src: str,
+        dst: str,
+        kind: str,
+        confidence: float,
+        *,
+        label: Optional[str] = None,
+        spec: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if not src or not dst or not kind:
+            return
+        if drop_self_edges and src == dst:
+            return
+
+        key = (src, dst, kind)
+        if key in seen:
+            return
+
+        seen.add(key)
+
+        edge: Dict[str, object] = {
+            "src": src,
+            "dst": dst,
+            "kind": kind,
+            "confidence": float(confidence),
+            "weight": float(confidence),
+        }
+        if label:
+            edge["label"] = label
+        if spec:
+            edge["spec"] = spec
+        if reason:
+            edge["reason"] = reason
+
+        edges_out.append(edge)
+
     files = getattr(idx, "files", {}) or {}
     fe_list: List[FileEntry] = [fe for fe in files.values() if isinstance(fe, FileEntry)]
 
@@ -968,12 +1083,13 @@ def build_edges_from_folder_index(
                 if drop_self_edges and dst == src:
                     continue
 
-                kind = "java:import:internal"
-                key = (src, dst, kind)
-                if key in seen:
-                    continue
-                seen.add(key)
-                edges_out.append({"src": src, "dst": dst, "kind": kind, "confidence": 0.8})
+                _add_edge(
+                    src,
+                    dst,
+                    "java:import:internal",
+                    0.8,
+                    reason="java_import_internal",
+                )
 
     # -------------------------
     # External edges (optional)
@@ -1001,23 +1117,27 @@ def build_edges_from_folder_index(
                         kind = f"java:import:{getattr(rr, 'kind', 'external')}"
                         dst = str(getattr(rr, "spec", spec) or spec)
 
-                        if drop_self_edges and dst == src:
-                            continue
-                        key = (src, dst, kind)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        edges_out.append({"src": src, "dst": dst, "kind": kind, "confidence": 0.4})
+                        _add_edge(
+                            src,
+                            dst,
+                            kind,
+                            0.4,
+                            label=dst,
+                            spec=spec,
+                            reason="java_import_external_resolved",
+                        )
                 else:
                     kind = "java:import:external_raw"
                     dst = spec
-                    if drop_self_edges and dst == src:
-                        continue
-                    key = (src, dst, kind)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    edges_out.append({"src": src, "dst": dst, "kind": kind, "confidence": 0.2})
+                    _add_edge(
+                        src,
+                        dst,
+                        kind,
+                        0.2,
+                        label=spec,
+                        spec=spec,
+                        reason="java_import_external_raw",
+                    )
 
     # -------------------------
     # Optional enrichment edges
@@ -1026,18 +1146,6 @@ def build_edges_from_folder_index(
     parse_cache = getattr(cfg, "java_parse_cache", None) if cfg else None
 
     if enrich and isinstance(parse_cache, dict) and parse_cache:
-        # Helper to add additive edges safely
-        def _add_edge(src: str, dst: str, kind: str, confidence: float) -> None:
-            if not src or not dst or not kind:
-                return
-            if drop_self_edges and src == dst:
-                return
-            key = (src, dst, kind)
-            if key in seen:
-                return
-            seen.add(key)
-            edges_out.append({"src": src, "dst": dst, "kind": kind, "confidence": float(confidence)})
-
         # Lookup cached record using file-id & rel-path variants (same strategy as NodeFacts)
         def _cache_get(fe: FileEntry) -> Optional[object]:
             rel_file = str(getattr(fe, "file", "") or "").strip()

@@ -126,6 +126,37 @@ def _diag_sample_map(m: Mapping, *, max_items: int = 5) -> Dict[str, object]:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _tuple_strs(value: object) -> Tuple[str, ...]:
+    """
+    Normalize a JSON-loaded sequence into tuple[str, ...].
+    Tolerates older artifacts with missing/null/scalar fields.
+    """
+    if value is None:
+        return tuple()
+
+    if isinstance(value, str):
+        s = value.strip()
+        return (s,) if s else tuple()
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return tuple(out)
+
+    s = str(value).strip()
+    return (s,) if s else tuple()
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
 def _iter_rust_files(root: Path, *, include_tests: bool = True) -> List[Path]:
     """Deterministic, de-duped list of .rs files under root."""
     root = root.resolve()
@@ -939,6 +970,27 @@ def build_folder_index(
             mtime=mtime_iso if mtime_iso else None,
             hash=hash_int,
             import_style_counts={},
+            symbol_internal=tuple(),
+            imports_external=tuple(),  # computed after resolution below
+            language_facts={
+                "rust": {
+                    "use_statements": list(imports_all),
+                    "module_path": getattr(pf, "module_path", None),
+                    "crate_name": (
+                        getattr(pf, "module_path", "").split("::", 1)[0]
+                        if isinstance(getattr(pf, "module_path", None), str)
+                        and getattr(pf, "module_path", "")
+                        else None
+                    ),
+                    "mod_declarations": [
+                        {
+                            "name": getattr(d, "name", None),
+                            "is_inline": bool(getattr(d, "is_inline", False)),
+                        }
+                        for d in (getattr(pf, "mod_declarations", None) or [])
+                    ],
+                }
+            },
             error_snippet=err_snip,
             eligible=eligible,
         )
@@ -1003,34 +1055,111 @@ def build_folder_index(
 
     for fid, fe in files_map.items():
         mapped: List[str] = []
+        external_specs: List[str] = []
+        resolved_uses: List[Dict[str, object]] = []
 
         for spec in (fe.imports_all or ()):
+            spec_s = str(spec or "").strip()
+            if not spec_s:
+                continue
+
             resolved_internal_specs_total += 1
             rr_list = resolve_rust_use(
-                spec,
+                spec_s,
                 module_to_file=module_to_file,
                 crate_to_files=crate_to_files,
             )
+
+            resolved_any_internal = False
+
             for rr in rr_list:
-                reason = getattr(rr, "reason", "") or ""
+                reason = str(getattr(rr, "reason", "") or "").strip()
                 if reason:
                     rr_reason_counts[reason] = rr_reason_counts.get(reason, 0) + 1
 
-                if rr.kind == "internal" and rr.resolved:
-                    mapped.append(to_posix(rr.resolved))
+                rr_kind = str(getattr(rr, "kind", "") or "").strip()
+                rr_resolved = getattr(rr, "resolved", None)
+
+                if rr_kind == "internal" and rr_resolved:
+                    target = to_posix(rr_resolved)
+                    if not target:
+                        continue
+
+                    mapped.append(target)
+                    resolved_any_internal = True
+
+                    resolved_uses.append({
+                        "spec": spec_s,
+                        "target": target,
+                        "kind": "internal",
+                        "reason": reason or "rust_use_internal",
+                        "confidence": 0.8,
+                    })
+
+            if not resolved_any_internal:
+                external_specs.append(spec_s)
+                resolved_uses.append({
+                    "spec": spec_s,
+                    "target": spec_s,
+                    "kind": "external",
+                    "reason": "rust_use_external",
+                    "confidence": 0.4,
+                })
 
         # Add module-declaration internal edges
         extra_mod_edges = mod_decl_edges_by_file.get(fid, ())
         if extra_mod_edges:
-            mapped.extend(list(extra_mod_edges))
+            for target in extra_mod_edges:
+                target_s = to_posix(str(target or "").strip())
+                if not target_s:
+                    continue
+
+                mapped.append(target_s)
+                resolved_uses.append({
+                    "spec": f"mod::{Path(target_s).stem}",
+                    "target": target_s,
+                    "kind": "internal",
+                    "reason": "rust_mod_declaration",
+                    "confidence": 0.7,
+                })
 
         internal_files = tuple(sorted(set(mapped)))
+        imports_external = tuple(sorted(set(external_specs)))
         resolved_internal_files_total += len(internal_files)
         internal_edge_count += len(internal_files)
 
-        if internal_files == fe.imports_internal:
+        existing_language_facts = getattr(fe, "language_facts", {}) or {}
+        existing_rust_facts = (
+            existing_language_facts.get("rust", {})
+            if isinstance(existing_language_facts, dict)
+            else {}
+        )
+        existing_resolved_uses = (
+            existing_rust_facts.get("resolved_uses")
+            if isinstance(existing_rust_facts, dict)
+            else None
+        )
+
+        unchanged = (
+            internal_files == fe.imports_internal
+            and imports_external == fe.imports_external
+            and existing_resolved_uses
+        )
+
+        if unchanged:
             files2[fid] = fe
         else:
+            language_facts = dict(getattr(fe, "language_facts", {}) or {})
+            rust_facts = dict(language_facts.get("rust", {}) or {})
+
+            rust_facts.update({
+                "imports_internal": list(internal_files),
+                "imports_external": list(imports_external),
+                "resolved_uses": resolved_uses,
+            })
+
+            language_facts["rust"] = rust_facts
+            
             files2[fid] = FileEntry(
                 id=fe.id,
                 file=fe.file,
@@ -1049,11 +1178,19 @@ def build_folder_index(
                 mtime=fe.mtime,
                 hash=fe.hash,
                 import_style_counts=fe.import_style_counts,
+                symbol_internal=fe.symbol_internal,
+                imports_external=imports_external,
+                language_facts=language_facts,
                 error_snippet=fe.error_snippet,
                 eligible=fe.eligible,
             )
 
     files_map = files2
+
+    external_import_count = sum(
+        len(getattr(fe, "imports_external", ()) or ())
+        for fe in files_map.values()
+    )
 
     with_internal = sum(1 for fe in files_map.values() if fe.imports_internal)
     _diag_print(
@@ -1091,6 +1228,7 @@ def build_folder_index(
         "comment_pct": str(comment_pct_total if comment_pct_total is not None else ""),
         "parse_issues_count": str(len(parse_issues)),
         "module_index_count": str(len(module_to_file)),
+        "external_import_count": str(int(external_import_count)),
         "crate_index_count": str(len(crate_to_files)),
     }
 
@@ -1193,17 +1331,20 @@ def load_folder_index(path: Path) -> FolderIndex:
         file_id = to_posix(str(fid))
         file_path = rec.get("file", file_id) or file_id
 
-        imports_all_raw = rec.get("imports_all", []) or ()
-        if isinstance(imports_all_raw, (list, tuple)):
-            imports_all = tuple(imports_all_raw)
-        else:
-            imports_all = tuple()
-
-        imports_internal_raw = rec.get("imports_internal", []) or ()
-        if isinstance(imports_internal_raw, (list, tuple)):
-            imports_internal = tuple(imports_internal_raw)
-        else:
-            imports_internal = tuple()
+        imports_all = _tuple_strs(rec.get("imports_all", ()))
+        imports_internal = _tuple_strs(rec.get("imports_internal", ()))
+        imports_runtime = _tuple_strs(
+            rec.get("imports_runtime", imports_internal)
+        )
+        imports_runtime_internal = _tuple_strs(
+            rec.get(
+                "imports_runtime_internal",
+                rec.get("imports_runtime", imports_internal),
+            )
+        )
+        symbol_internal = _tuple_strs(rec.get("symbol_internal", ()))
+        imports_external = _tuple_strs(rec.get("imports_external", ()))
+        language_facts = _mapping_or_empty(rec.get("language_facts", {}))
 
         files[file_id] = FileEntry(
             id=file_id,
@@ -1212,12 +1353,8 @@ def load_folder_index(path: Path) -> FolderIndex:
             parse_status=str(rec.get("parse_status", "ok")),
             imports_all=imports_all,
             imports_internal=imports_internal,
-            imports_runtime=tuple(rec.get("imports_runtime") or imports_internal),
-            imports_runtime_internal=tuple(
-                rec.get("imports_runtime_internal")
-                or rec.get("imports_runtime")
-                or imports_internal
-            ),
+            imports_runtime=imports_runtime,
+            imports_runtime_internal=imports_runtime_internal,
             loc=rec.get("loc"),
             sloc=rec.get("sloc"),
             comment_lines=rec.get("comment_lines"),
@@ -1226,9 +1363,14 @@ def load_folder_index(path: Path) -> FolderIndex:
             size_bytes=rec.get("size_bytes"),
             mtime=rec.get("mtime"),
             hash=rec.get("hash"),
-            import_style_counts=rec.get("import_style_counts", {}) or {},
+            import_style_counts=_mapping_or_empty(
+                rec.get("import_style_counts", {})
+            ),
+            symbol_internal=symbol_internal,
+            imports_external=imports_external,
+            language_facts=language_facts,
             error_snippet=rec.get("error_snippet"),
-            eligible=rec.get("eligible", True),
+            eligible=bool(rec.get("eligible", True)),
         )
 
     return FolderIndex(schema=data["schema"], meta=data.get("meta", {}), files=files)

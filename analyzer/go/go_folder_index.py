@@ -4,7 +4,7 @@ from __future__ import annotations
 """
 FolderIndex — deterministic snapshot of a workspace's Go files.
 
-Schema: "folder-index-1.0.0" (analyzer_store.types)
+Schema: FOLDER_INDEX_SCHEMA (analyzer_store.types)
 
 Design mirrors analyzer_store/folder_index.py for Python:
   - Deterministic: stable sorting, deduped lists
@@ -30,6 +30,12 @@ UPDATED (metrics consistency):
   - FileEntry.loc is always physical LOC from local text metrics.
   - FileEntry.sloc is code/SLOC-like LOC, optionally using goextract loc_code when present.
   - comment_lines, blank_lines, and comment_pct are based on physical LOC.
+
+UPDATED (v1.2/v1.9-compatible):
+  - imports_all preserves raw Go import paths.
+  - imports_internal preserves resolved internal package ids.
+  - imports_external preserves unresolved external import paths.
+  - language_facts["go"] carries Go-specific parser/package facts.  
 """
 
 from dataclasses import asdict
@@ -69,6 +75,36 @@ except Exception:  # pragma: no cover
 
 _GO_IMPORT_RE = re.compile(r'^\s*import\s*(\(|")', re.MULTILINE)
 
+def _tuple_strs(value: object) -> Tuple[str, ...]:
+    """
+    Normalize a JSON-loaded sequence into tuple[str, ...].
+    Tolerates older artifacts with missing/null/scalar fields.
+    """
+    if value is None:
+        return tuple()
+
+    if isinstance(value, str):
+        s = value.strip()
+        return (s,) if s else tuple()
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return tuple(out)
+
+    s = str(value).strip()
+    return (s,) if s else tuple()
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    if isinstance(value, dict):
+        return value
+    return {}
 
 def _find_go_mod(repo_root: Path, *, go_files: Optional[Sequence[Path]] = None) -> Optional[Path]:
     """
@@ -789,6 +825,15 @@ def build_folder_index(root: Path, cfg, files: Optional[Sequence[Path]] = None) 
 
         name = Path(rel_file).name
 
+        go_language_facts = {
+            "package_id": mod_id,
+            "file": rel_file,
+            "module_path": module_path,
+            "go_mod": to_posix(go_mod.relative_to(root)) if go_mod else "",
+            "imports": list(tuple(sorted(imports_all_set))),
+            "import_classification": dict(style_counts),
+        }
+
         entry = FileEntry(
             id=mod_id,
             file=rel_file,
@@ -809,6 +854,13 @@ def build_folder_index(root: Path, cfg, files: Optional[Sequence[Path]] = None) 
             mtime=mtime_iso,
             hash=short_hash,
             import_style_counts=style_counts,
+
+            symbol_internal=tuple(),
+            imports_external=tuple(),  # computed during internal resolution
+            language_facts={
+                "go": go_language_facts,
+            },
+
             error_snippet=err_snip,
             eligible=eligible,
         )
@@ -827,6 +879,8 @@ def build_folder_index(root: Path, cfg, files: Optional[Sequence[Path]] = None) 
     files2: Dict[str, FileEntry] = {}
     for k, fe in files_map.items():
         mapped: List[str] = []
+        external_specs: List[str] = []
+
         for spec in (fe.imports_all or ()):
             rr = resolve_go_import(
                 spec,
@@ -834,14 +888,31 @@ def build_folder_index(root: Path, cfg, files: Optional[Sequence[Path]] = None) 
                 internal_pkg_ids=internal_pkg_ids,
                 allow_prefix_collapse=True,
             )
+
             if rr.kind == "internal" and rr.resolved:
                 mapped.append(normalize_import_spec(rr.resolved))
+            else:
+                external_specs.append(normalize_import_spec(spec))
 
         internal_mods = tuple(sorted(set(mapped)))
+        imports_external = tuple(sorted(set(x for x in external_specs if x)))
 
-        if internal_mods == fe.imports_internal:
+        unchanged = (
+            internal_mods == fe.imports_internal
+            and imports_external == fe.imports_external
+        )
+
+        if unchanged:
             files2[k] = fe
         else:
+            language_facts = dict(getattr(fe, "language_facts", {}) or {})
+            go_facts = dict(language_facts.get("go", {}) or {})
+            go_facts.update({
+                "imports_internal": list(internal_mods),
+                "imports_external": list(imports_external),
+            })
+            language_facts["go"] = go_facts
+
             files2[k] = FileEntry(
                 id=fe.id,
                 file=fe.file,
@@ -862,6 +933,11 @@ def build_folder_index(root: Path, cfg, files: Optional[Sequence[Path]] = None) 
                 mtime=fe.mtime,
                 hash=fe.hash,
                 import_style_counts=fe.import_style_counts,
+
+                symbol_internal=fe.symbol_internal,
+                imports_external=imports_external,
+                language_facts=language_facts,
+
                 error_snippet=fe.error_snippet,
                 eligible=fe.eligible,
             )
@@ -870,6 +946,10 @@ def build_folder_index(root: Path, cfg, files: Optional[Sequence[Path]] = None) 
 
     parsed_count = sum(1 for v in files_map.values() if v.parse_status == "ok")
     internal_edge_count = sum(len(v.imports_internal or ()) for v in files_map.values())
+    external_import_count = sum(
+        len(getattr(v, "imports_external", ()) or ())
+        for v in files_map.values()
+    )
 
     total_loc = sum(int(v.loc or 0) for v in files_map.values())
     total_sloc = sum(int(v.sloc or 0) for v in files_map.values())
@@ -885,6 +965,7 @@ def build_folder_index(root: Path, cfg, files: Optional[Sequence[Path]] = None) 
         "eligible_count": str(len(files_map)),
         "parsed_count": str(parsed_count),
         "internal_edge_count": str(int(internal_edge_count)),
+        "external_import_count": str(int(external_import_count)),
         "module_path": str(module_path or ""),
         "go_mod": str(to_posix(go_mod.relative_to(root)) if go_mod else ""),
         "parse_issues_count": str(len(parse_issues)),
@@ -951,15 +1032,30 @@ def load_folder_index(path: Path) -> FolderIndex:
         if not fid:
             raise KeyError(f"Missing 'folder_id' in record for {key}")
 
+        imports_all = _tuple_strs(rec.get("imports_all", ()))
+        imports_internal = _tuple_strs(rec.get("imports_internal", ()))
+        imports_runtime = _tuple_strs(
+            rec.get("imports_runtime", imports_internal)
+        )
+        imports_runtime_internal = _tuple_strs(
+            rec.get(
+                "imports_runtime_internal",
+                rec.get("imports_runtime", imports_internal),
+            )
+        )
+        symbol_internal = _tuple_strs(rec.get("symbol_internal", ()))
+        imports_external = _tuple_strs(rec.get("imports_external", ()))
+        language_facts = _mapping_or_empty(rec.get("language_facts", {}))
+
         files[key] = FileEntry(
             id=str(fid),
             file=str(rec.get("file", "")),
             name=str(rec.get("name", "")),
             parse_status=str(rec.get("parse_status", "ok")),
-            imports_all=tuple(rec.get("imports_all", []) or ()),
-            imports_internal=tuple(rec.get("imports_internal", []) or ()),
-            imports_runtime=tuple(rec.get("imports_runtime") or ()),
-            imports_runtime_internal=tuple(rec.get("imports_runtime_internal") or ()),
+            imports_all=imports_all,
+            imports_internal=imports_internal,
+            imports_runtime=imports_runtime,
+            imports_runtime_internal=imports_runtime_internal,
             loc=rec.get("loc"),
             sloc=rec.get("sloc"),
             comment_lines=rec.get("comment_lines"),
@@ -968,7 +1064,12 @@ def load_folder_index(path: Path) -> FolderIndex:
             size_bytes=rec.get("size_bytes"),
             mtime=rec.get("mtime"),
             hash=rec.get("hash"),
-            import_style_counts=rec.get("import_style_counts", {}) or {},
+            import_style_counts=_mapping_or_empty(
+                rec.get("import_style_counts", {})
+            ),
+            symbol_internal=symbol_internal,
+            imports_external=imports_external,
+            language_facts=language_facts,
             error_snippet=rec.get("error_snippet"),
             eligible=bool(rec.get("eligible", True)),
         )

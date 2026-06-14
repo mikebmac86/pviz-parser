@@ -87,6 +87,36 @@ _STDLIB_PREFIXES = (
     "com.sun.",
 )
 
+def _tuple_strs(value: object) -> Tuple[str, ...]:
+    """
+    Normalize a JSON-loaded sequence into tuple[str, ...].
+    Tolerates older artifacts with missing/null/scalar fields.
+    """
+    if value is None:
+        return tuple()
+
+    if isinstance(value, str):
+        s = value.strip()
+        return (s,) if s else tuple()
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return tuple(out)
+
+    s = str(value).strip()
+    return (s,) if s else tuple()
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    if isinstance(value, dict):
+        return value
+    return {}
 
 def _iter_java_files(root: Path, *, include_tests: bool = True) -> List[Path]:
     root = root.resolve()
@@ -784,7 +814,7 @@ def build_folder_index(
             file=rel_file,
             name=Path(rel_file).name,
             parse_status=parse_status,
-            imports_all=tuple(imports_all_list),
+            imports_all=tuple(sorted(set(imports_all_list))),
             imports_internal=tuple(),
             imports_runtime=tuple(),
             imports_runtime_internal=tuple(),
@@ -797,6 +827,18 @@ def build_folder_index(
             mtime=mtime_iso if mtime_iso else None,
             hash=hash_int,
             import_style_counts={},
+            symbol_internal=tuple(),
+            imports_external=tuple(),  # computed after resolution
+            language_facts={
+                "java": {
+                    "package": getattr(pf, "package", None),
+                    "imports": list(tuple(sorted(set(imports_all_list)))),
+                    "classes": list(getattr(pf, "classes", []) or []),
+                    "functions": list(getattr(pf, "functions", []) or []),
+                    "globals": list(getattr(pf, "globals", []) or []),
+                    "exports": list(getattr(pf, "all_exports", []) or []),
+                }
+            },
             error_snippet=err_snip,
             eligible=eligible,
         )
@@ -907,13 +949,15 @@ def build_folder_index(
         third_party_total += len(third_party_specs_t)
         internal_unresolved_total += len(internal_unresolved_specs_t)
 
-        imports_all_clean = tuple(
+        # v1.9: unresolved specs belong here, not in imports_all.
+        # imports_all should remain the raw Java import surface from the parser.
+        imports_external = tuple(
             sorted(set(stdlib_specs_t + third_party_specs_t + internal_unresolved_specs_t))
         )
 
         style_counts = {
             "internal": len(internal_files),
-            "external": len(imports_all_clean),
+            "external": len(imports_external),
             "stdlib": len(stdlib_specs_t),
             "third_party": len(third_party_specs_t),
             "internal_unresolved": len(internal_unresolved_specs_t),
@@ -921,12 +965,22 @@ def build_folder_index(
             "symbol_internal": 0,
         }
 
+        # Optional richer Java details under the language-neutral extension field.
+        language_facts = dict(getattr(fe, "language_facts", {}) or {})
+        java_facts = dict(language_facts.get("java", {}) or {})
+        java_facts.update({
+            "imports_stdlib": list(stdlib_specs_t),
+            "imports_third_party": list(third_party_specs_t),
+            "imports_internal_unresolved": list(internal_unresolved_specs_t),
+        })
+        language_facts["java"] = java_facts
+
         files2[k] = FileEntry(
             id=fe.id,
             file=fe.file,
             name=fe.name,
             parse_status=fe.parse_status,
-            imports_all=imports_all_clean,
+            imports_all=fe.imports_all,
             imports_internal=internal_files,
             imports_runtime=internal_files,
             imports_runtime_internal=internal_files,
@@ -939,11 +993,19 @@ def build_folder_index(
             mtime=fe.mtime,
             hash=fe.hash,
             import_style_counts=style_counts,
+            symbol_internal=fe.symbol_internal,
+            imports_external=imports_external,
+            language_facts=language_facts,
             error_snippet=fe.error_snippet,
             eligible=fe.eligible,
         )
 
     files_map = files2
+
+    external_import_count = sum(
+        len(getattr(fe, "imports_external", ()) or ())
+        for fe in files_map.values()
+    )
 
     try:
         with_internal = sum(1 for fe in files_map.values() if fe.imports_internal and len(fe.imports_internal) > 0)
@@ -992,6 +1054,7 @@ def build_folder_index(
         "total_size_bytes": str(int(total_size_bytes)),
         "imports_total_specs_considered": str(int(resolved_specs_considered_total)),
         "imports_internal_count": str(int(internal_edge_count)),
+        "external_import_count": str(int(external_import_count)),
         "imports_stdlib_count": str(int(stdlib_total)),
         "imports_third_party_count": str(int(third_party_total)),
         "imports_internal_unresolved_count": str(int(internal_unresolved_total)),
@@ -1108,14 +1171,20 @@ def load_folder_index(path: Path) -> FolderIndex:
         file_id = to_posix(str(fid))
         file_path = to_posix(str(rec.get("file", file_id) or file_id))
 
-        imports_all = tuple(rec.get("imports_all", []) or ())
-        imports_internal = tuple(rec.get("imports_internal", []) or ())
-        imports_runtime = tuple(rec.get("imports_runtime") or imports_internal)
-        imports_runtime_internal = tuple(
-            rec.get("imports_runtime_internal")
-            or rec.get("imports_runtime")
-            or imports_internal
+        imports_all = _tuple_strs(rec.get("imports_all", ()))
+        imports_internal = _tuple_strs(rec.get("imports_internal", ()))
+        imports_runtime = _tuple_strs(
+            rec.get("imports_runtime", imports_internal)
         )
+        imports_runtime_internal = _tuple_strs(
+            rec.get(
+                "imports_runtime_internal",
+                rec.get("imports_runtime", imports_internal),
+            )
+        )
+        symbol_internal = _tuple_strs(rec.get("symbol_internal", ()))
+        imports_external = _tuple_strs(rec.get("imports_external", ()))
+        language_facts = _mapping_or_empty(rec.get("language_facts", {}))
 
         files[file_id] = FileEntry(
             id=file_id,
@@ -1134,7 +1203,12 @@ def load_folder_index(path: Path) -> FolderIndex:
             size_bytes=rec.get("size_bytes"),
             mtime=rec.get("mtime"),
             hash=rec.get("hash"),
-            import_style_counts=rec.get("import_style_counts", {}) or {},
+            import_style_counts=_mapping_or_empty(
+                rec.get("import_style_counts", {})
+            ),
+            symbol_internal=symbol_internal,
+            imports_external=imports_external,
+            language_facts=language_facts,
             error_snippet=rec.get("error_snippet"),
             eligible=bool(rec.get("eligible", True)),
         )

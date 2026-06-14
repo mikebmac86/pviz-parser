@@ -4,6 +4,44 @@ from pathlib import Path
 from typing import Any, Dict, List, Mapping
 
 
+def _copy_mapping(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, Mapping):
+        return {}
+
+    return {
+        str(k): v
+        for k, v in value.items()
+        if isinstance(k, str) and k
+    }
+
+
+def _copy_list(value: Any) -> List[Any]:
+    if not isinstance(value, list):
+        return []
+    return list(value)
+
+
+def _copy_nonempty_list_field(
+    *,
+    src: Mapping[str, Any],
+    dst: Dict[str, Any],
+    key: str,
+) -> None:
+    val = src.get(key)
+    if isinstance(val, list) and val:
+        dst[key] = val
+
+
+def _copy_present_field(
+    *,
+    src: Mapping[str, Any],
+    dst: Dict[str, Any],
+    key: str,
+) -> None:
+    if key in src and src.get(key) is not None:
+        dst[key] = src.get(key)
+
+
 def build_nodes(nodefacts: Mapping[str, Any]) -> Dict[str, Any]:
     raw_nodes = nodefacts.get("nodes", {}) or {}
     out: Dict[str, Any] = {}
@@ -35,24 +73,34 @@ def build_nodes(nodefacts: Mapping[str, Any]) -> Dict[str, Any]:
         except Exception:
             pass
 
-        # Core fields (all languages)
-        for k in ("lang", "language", "kind", "file_ext"):
-            if k in nf and nf.get(k) is not None:
-                node_entry[k] = nf.get(k)
+        # ------------------------------------------------------------------
+        # Core fields
+        # ------------------------------------------------------------------
+        for k in (
+            "lang",
+            "language",
+            "kind",
+            "file_ext",
+            "parse_status",
+        ):
+            _copy_present_field(src=nf, dst=node_entry, key=k)
 
-        # Metrics (all languages)
+        # ------------------------------------------------------------------
+        # Metrics and graph summary
+        #
         # Version notes:
-        # - v1.7 adds richer metadata fields, not SCC semantics
+        # - v1.7 adds richer metadata fields, not SCC semantics.
         # - v1.8 adds runtime SCC fields:
         #     scc_id_runtime
         #     scc_size_runtime
+        # - v1.9 adds raw/external imports and language_facts.
+        # ------------------------------------------------------------------
         for k in (
             "loc",
             "sloc",
             "comment_lines",
             "blank_lines",
             "comment_pct",
-            "parse_status",
             "importers_count",
             "dependencies_count",
             "scc_id",
@@ -63,10 +111,32 @@ def build_nodes(nodefacts: Mapping[str, Any]) -> Dict[str, Any]:
             if k in nf:
                 node_entry[k] = nf.get(k)
 
-        # Symbol lists (all languages)
-        # v1.7 detailed metadata fields:
-        #   functions_detailed, classes_detailed, globals_detailed
-        # v1.8 does not add symbol metadata fields; it adds runtime SCC fields above.
+        # ------------------------------------------------------------------
+        # v1.9 canonical fields
+        #
+        # These should survive into the final merged bundle. They are not
+        # Ruby-specific; Ruby, Rust, Java, Kotlin, Go, Python, and TS/JS can all
+        # use them.
+        # ------------------------------------------------------------------
+        language_facts = _copy_mapping(nf.get("language_facts"))
+        if language_facts:
+            node_entry["language_facts"] = language_facts
+
+        for key in (
+            "imports_all_raw",
+            "imports_external",
+            "symbol_internal",
+        ):
+            _copy_nonempty_list_field(src=nf, dst=node_entry, key=key)
+
+        _copy_present_field(src=nf, dst=node_entry, key="eligible")
+
+        # ------------------------------------------------------------------
+        # Symbol lists / language-neutral projections
+        #
+        # Keep these compact top-level fields because the bundle consumers already
+        # expect them. Full per-language richness should live in language_facts.
+        # ------------------------------------------------------------------
         for key in (
             "functions",
             "classes",
@@ -77,54 +147,14 @@ def build_nodes(nodefacts: Mapping[str, Any]) -> Dict[str, Any]:
             "classes_detailed",
             "globals_detailed",
         ):
-            val = nf.get(key)
-            if isinstance(val, list) and val:
-                node_entry[key] = val
+            _copy_nonempty_list_field(src=nf, dst=node_entry, key=key)
 
-        # ========================================================================
-        # JAVA-SPECIFIC FIELDS
-        # ========================================================================
-        for key in ("package", "declared_types", "declared_types_fq", "public_exports", "annotations"):
-            val = nf.get(key)
-            if val is not None:
-                if isinstance(val, list):
-                    if val:
-                        node_entry[key] = val
-                else:
-                    node_entry[key] = val
-        # ========================================================================
-
-# ========================================================================
-        # KOTLIN-SPECIFIC FIELDS
-        # ========================================================================
-        # List fields: only include if non-empty
+        # ------------------------------------------------------------------
+        # Java / Kotlin / Ruby shared JVM-style or declaration fields
+        # ------------------------------------------------------------------
         for key in (
-            "interfaces",
-            "objects",
-            "enums",
-            "type_aliases",
-            "properties",
-            "annotations",
-            "imports_all_raw",
-            "imports_external",
-        ):
-            val = nf.get(key)
-            if isinstance(val, list) and val:
-                node_entry[key] = val
-
-        # Scalar fields: include if present and non-None
-        for key in ("package_name",):
-            val = nf.get(key)
-            if val is not None:
-                node_entry[key] = val
-        # ========================================================================
-
-        # ========================================================================
-        # RUST-SPECIFIC FIELDS
-        # ========================================================================
-        for key in (
-            "module_path",
-            "crate_name",
+            "package",
+            "package_name",
             "declared_types",
             "declared_types_fq",
             "public_exports",
@@ -138,30 +168,66 @@ def build_nodes(nodefacts: Mapping[str, Any]) -> Dict[str, Any]:
                 else:
                     node_entry[key] = val
 
-        for key in ("structs", "enums", "traits", "impls", "type_aliases", "mod_declarations"):
-            val = nf.get(key)
-            if isinstance(val, list) and val:
-                node_entry[key] = val
-        # ========================================================================
+        # ------------------------------------------------------------------
+        # Kotlin-specific projected fields
+        # ------------------------------------------------------------------
+        for key in (
+            "interfaces",
+            "objects",
+            "enums",
+            "type_aliases",
+            "properties",
+        ):
+            _copy_nonempty_list_field(src=nf, dst=node_entry, key=key)
 
-        # ========================================================================
-        # CROSSTALK CANDIDATES (Python ↔ TypeScript)
-        # ========================================================================
-        # Preserve crosstalk candidates from both Python and TypeScript analyzers.
-        for key in ("crosstalk_candidates_py_v1", "crosstalk_candidates_ts_v1"):
-            val = nf.get(key)
-            if isinstance(val, list) and val:
-                node_entry[key] = val
-        # ========================================================================
+        # ------------------------------------------------------------------
+        # Rust-specific projected fields
+        # ------------------------------------------------------------------
+        for key in (
+            "module_path",
+            "crate_name",
+        ):
+            _copy_present_field(src=nf, dst=node_entry, key=key)
 
+        for key in (
+            "structs",
+            "traits",
+            "impls",
+            "mod_declarations",
+        ):
+            _copy_nonempty_list_field(src=nf, dst=node_entry, key=key)
+
+        # ------------------------------------------------------------------
+        # Crosstalk candidates
+        # ------------------------------------------------------------------
+        for key in (
+            "crosstalk_candidates_py_v1",
+            "crosstalk_candidates_ts_v1",
+        ):
+            _copy_nonempty_list_field(src=nf, dst=node_entry, key=key)
+
+        # ------------------------------------------------------------------
         # Additional facts
+        #
+        # Keep the small generic facts block for compact legacy consumers. Do not
+        # duplicate language_facts here.
+        # ------------------------------------------------------------------
         facts: Dict[str, Any] = {}
-        for k in ("gen_seq", "du", "dd", "hash", "mtime", "size_bytes"):
+
+        for k in (
+            "gen_seq",
+            "du",
+            "dd",
+            "hash",
+            "mtime",
+            "size_bytes",
+        ):
             if k in nf and nf.get(k) is not None:
                 facts[k] = nf.get(k)
 
         imp = nf.get("imports")
         exp = nf.get("exports")
+
         if isinstance(imp, list):
             facts["imports"] = imp
         elif imp is not None and "imports" not in facts:
@@ -193,55 +259,129 @@ def build_edges(edges_data: Mapping[str, Any]) -> List[Dict[str, Any]]:
 
         src = e.get("src")
         dst = e.get("dst")
+
         if not isinstance(src, str) or not src:
             continue
         if not isinstance(dst, str) or not dst:
             continue
 
         kind = e.get("kind", "import")
-        edge_entry: Dict[str, Any] = {"src": src, "dst": dst, "kind": kind}
 
-        if "subkind" in e and isinstance(e.get("subkind"), str):
-            edge_entry["subkind"] = e.get("subkind")
+        edge_entry: Dict[str, Any] = {
+            "src": src,
+            "dst": dst,
+            "kind": kind,
+        }
+
+        # ------------------------------------------------------------------
+        # Canonical/simple edge metadata
+        #
+        # v1.9+ language builders increasingly emit these directly.
+        # ------------------------------------------------------------------
+        for key in (
+            "subkind",
+            "label",
+            "spec",
+            "reason",
+        ):
+            val = e.get(key)
+            if isinstance(val, str) and val:
+                edge_entry[key] = val
+
+        for key in (
+            "confidence",
+            "weight",
+        ):
+            if key in e:
+                try:
+                    edge_entry[key] = float(e.get(key))
+                except Exception:
+                    pass
+
         if "synthetic" in e and isinstance(e.get("synthetic"), bool):
             edge_entry["synthetic"] = e.get("synthetic")
 
+        # ------------------------------------------------------------------
+        # Rich reason list, used by older Python/TS crosstalk paths.
+        # ------------------------------------------------------------------
         reasons = e.get("reasons")
         if isinstance(reasons, list) and reasons:
             cleaned_reasons: List[Dict[str, Any]] = []
+
             for r in reasons:
                 if not isinstance(r, Mapping):
                     continue
+
                 rr: Dict[str, Any] = {}
+
                 syms = r.get("symbols")
                 if isinstance(syms, list):
                     rr["symbols"] = syms
-                for k in ("conditional", "ambiguous", "unresolved"):
+
+                for k in (
+                    "conditional",
+                    "ambiguous",
+                    "unresolved",
+                ):
                     if k in r and isinstance(r.get(k), bool):
                         rr[k] = r.get(k)
+
+                # Preserve optional newer reason fields when present.
+                for k in (
+                    "reason",
+                    "label",
+                    "spec",
+                    "target",
+                    "source",
+                ):
+                    val = r.get(k)
+                    if isinstance(val, str) and val:
+                        rr[k] = val
+
+                if "confidence" in r:
+                    try:
+                        rr["confidence"] = float(r.get("confidence"))
+                    except Exception:
+                        pass
+
                 if rr:
                     cleaned_reasons.append(rr)
+
             if cleaned_reasons:
                 edge_entry["reasons"] = cleaned_reasons
 
+        # ------------------------------------------------------------------
+        # Evidence block
+        # ------------------------------------------------------------------
         evidence = e.get("evidence")
         if isinstance(evidence, Mapping):
             ev: Dict[str, Any] = {}
-            if isinstance(evidence.get("kind"), str):
-                ev["kind"] = evidence.get("kind")
-            if isinstance(evidence.get("token"), str):
-                ev["token"] = evidence.get("token")
-            if isinstance(evidence.get("reason"), str):
-                ev["reason"] = evidence.get("reason")
+
+            for k in (
+                "kind",
+                "token",
+                "reason",
+                "label",
+                "spec",
+                "target",
+                "source",
+            ):
+                val = evidence.get(k)
+                if isinstance(val, str) and val:
+                    ev[k] = val
+
             if "confidence" in evidence:
-                c = evidence.get("confidence")
                 try:
-                    ev["confidence"] = float(c)
+                    ev["confidence"] = float(evidence.get("confidence"))
                 except Exception:
                     pass
+
             if ev:
                 edge_entry["evidence"] = ev
 
+        # ------------------------------------------------------------------
+        # Crosstalk metadata
+        # ------------------------------------------------------------------
         crosstalk = e.get("crosstalk")
         if isinstance(crosstalk, Mapping) and crosstalk:
             edge_entry["crosstalk"] = dict(crosstalk)

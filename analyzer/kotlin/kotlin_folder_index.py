@@ -93,6 +93,36 @@ _KOTLIN_IGNORE_SYMBOLS: Set[str] = {
     "java", "javax", "kotlin", "kotlinx", "org", "com", "net", "io",
 }
 
+def _tuple_strs(value: object) -> Tuple[str, ...]:
+    """
+    Normalize a JSON-loaded sequence into tuple[str, ...].
+    Tolerates older artifacts with missing/null/scalar fields.
+    """
+    if value is None:
+        return tuple()
+
+    if isinstance(value, str):
+        s = value.strip()
+        return (s,) if s else tuple()
+
+    if isinstance(value, (list, tuple, set, frozenset)):
+        out: List[str] = []
+        for item in value:
+            if item is None:
+                continue
+            s = str(item).strip()
+            if s:
+                out.append(s)
+        return tuple(out)
+
+    s = str(value).strip()
+    return (s,) if s else tuple()
+
+
+def _mapping_or_empty(value: object) -> Mapping[str, object]:
+    if isinstance(value, dict):
+        return value
+    return {}
 
 def _iter_kotlin_files(
     root: Path,
@@ -857,7 +887,6 @@ def build_folder_index(
         eligible = not (isinstance(max_bytes, int) and max_bytes > 0 and size > max_bytes)
 
         imports_all_raw: Tuple[str, ...] = ()
-        imports_all: Tuple[str, ...] = ()
         mapped: List[str] = []
         external_specs: List[str] = []
         resolved_internal_specs: Set[str] = set()
@@ -906,10 +935,6 @@ def build_folder_index(
                     resolved_internal_specs.add(spec)
                 else:
                     external_specs.append(spec)
-
-            imports_all = tuple(
-                sorted(spec for spec in imports_all_raw if spec not in resolved_internal_specs)
-            )
 
         if parse_status != "ok":
             parse_issues.append(f"{file_id}: {error or parse_status}")
@@ -987,16 +1012,60 @@ def build_folder_index(
             "symbol_internal": len(symbol_edges - explicit_import_edges),
         }
 
+        kotlin_language_facts = {
+            "package": getattr(pf, "package_name", None) if pf is not None else None,
+            "imports": list(imports_all_raw),
+            "imports_external": list(imports_external_fe),
+            "classes": [
+                str(getattr(d, "name", "") or "")
+                for d in (getattr(pf, "classes", None) or ())
+                if str(getattr(d, "name", "") or "").strip()
+            ] if pf is not None else [],
+            "interfaces": [
+                str(getattr(d, "name", "") or "")
+                for d in (getattr(pf, "interfaces", None) or ())
+                if str(getattr(d, "name", "") or "").strip()
+            ] if pf is not None else [],
+            "objects": [
+                str(getattr(d, "name", "") or "")
+                for d in (getattr(pf, "objects", None) or ())
+                if str(getattr(d, "name", "") or "").strip()
+            ] if pf is not None else [],
+            "enums": [
+                str(getattr(d, "name", "") or "")
+                for d in (getattr(pf, "enums", None) or ())
+                if str(getattr(d, "name", "") or "").strip()
+            ] if pf is not None else [],
+            "type_aliases": [
+                str(getattr(d, "name", "") or "")
+                for d in (getattr(pf, "type_aliases", None) or ())
+                if str(getattr(d, "name", "") or "").strip()
+            ] if pf is not None else [],
+            "functions": _function_names(pf) if pf is not None else [],
+            "properties": _property_names(pf) if pf is not None else [],
+            "refs_raw": list(getattr(pf, "refs_raw", []) or ()) if pf is not None else [],
+        }
+
         fe = FileEntry(
             id=file_id,
             file=rel,
             name=Path(rel).name,
             parse_status=parse_status,
-            imports_all=imports_all,
+
+            # v1.9: preserve raw Kotlin import specs from parser.
+            imports_all=imports_all_raw,
+
+            # Graph-facing resolved internal file targets.
             imports_internal=imports_internal,
             imports_runtime=imports_runtime,
             imports_runtime_internal=imports_runtime_internal,
+
             symbol_internal=symbol_internal,
+            imports_external=imports_external_fe,
+            language_facts={
+                "kotlin": kotlin_language_facts,
+            },
+
             loc=loc if loc else None,
             sloc=loc_code if loc_code else None,
             comment_lines=comment_lines if comment_lines else None,
@@ -1018,12 +1087,17 @@ def build_folder_index(
     comment_pct_total = (total_comment_lines / total_loc) if total_loc else None
     parsed_count = sum(1 for fe in files_map.values() if fe.parse_status == "ok")
     eligible_count = sum(1 for fe in files_map.values() if bool(getattr(fe, "eligible", True)))
+    external_import_count = sum(
+        len(getattr(fe, "imports_external", ()) or ())
+        for fe in files_map.values()
+    )
 
     meta = {
         "created": str(iso_utc()),
         "root": str(to_posix(root.resolve())),
         "language": "kotlin",
         "eligible_count": str(int(eligible_count)),
+        "external_import_count": str(int(external_import_count)),
         "parsed_count": str(int(parsed_count)),
         "internal_edge_count": str(int(internal_edge_count)),
         "explicit_internal_edge_count": str(int(explicit_internal_edge_count)),
@@ -1108,15 +1182,20 @@ def load_folder_index(path: Path) -> FolderIndex:
         file_id = to_posix(str(fid))
         file_path = to_posix(str(rec.get("file", file_id) or file_id))
 
-        imports_all = tuple(rec.get("imports_all", []) or ())
-        imports_internal = tuple(rec.get("imports_internal", []) or ())
-        imports_runtime = tuple(rec.get("imports_runtime") or imports_internal)
-        imports_runtime_internal = tuple(
-            rec.get("imports_runtime_internal")
-            or rec.get("imports_runtime")
-            or imports_internal
+        imports_all = _tuple_strs(rec.get("imports_all", ()))
+        imports_internal = _tuple_strs(rec.get("imports_internal", ()))
+        imports_runtime = _tuple_strs(
+            rec.get("imports_runtime", imports_internal)
         )
-        symbol_internal = tuple(rec.get("symbol_internal", []) or ())
+        imports_runtime_internal = _tuple_strs(
+            rec.get(
+                "imports_runtime_internal",
+                rec.get("imports_runtime", imports_internal),
+            )
+        )
+        symbol_internal = _tuple_strs(rec.get("symbol_internal", ()))
+        imports_external = _tuple_strs(rec.get("imports_external", ()))
+        language_facts = _mapping_or_empty(rec.get("language_facts", {}))
 
         files[file_id] = FileEntry(
             id=file_id,
@@ -1128,6 +1207,8 @@ def load_folder_index(path: Path) -> FolderIndex:
             imports_runtime=imports_runtime,
             imports_runtime_internal=imports_runtime_internal,
             symbol_internal=symbol_internal,
+            imports_external=imports_external,
+            language_facts=language_facts,
             loc=rec.get("loc"),
             sloc=rec.get("sloc"),
             comment_lines=rec.get("comment_lines"),
@@ -1136,7 +1217,9 @@ def load_folder_index(path: Path) -> FolderIndex:
             size_bytes=rec.get("size_bytes"),
             mtime=rec.get("mtime"),
             hash=rec.get("hash"),
-            import_style_counts=rec.get("import_style_counts", {}) or {},
+            import_style_counts=_mapping_or_empty(
+                rec.get("import_style_counts", {})
+            ),
             error_snippet=rec.get("error_snippet"),
             eligible=bool(rec.get("eligible", True)),
         )

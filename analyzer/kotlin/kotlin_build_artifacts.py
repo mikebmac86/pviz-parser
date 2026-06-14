@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 import time
 
-from analyzer_store.types import FileEntry, FolderIndex
+from analyzer_store.types import FileEntry, FolderIndex, NODEFACTS_SCHEMA
 from adapters.canonical import to_posix
 from analyzer.kotlin.kotlin_nodefacts_symbols import NodeFactsSymbols, parse_symbols_for_nodefacts
 
@@ -49,6 +49,7 @@ def _stub_node(node_id: str) -> Dict[str, Any]:
         "annotations": (),
         "imports_all_raw": (),
         "imports_external": (),
+        "language_facts": {},
         "gen_seq": 0,
         "importers_count": 0,
         "dependencies_count": 0,
@@ -190,6 +191,7 @@ def build_nodefacts_from_folder_index(
                 "annotations": (),
                 "imports_all_raw": (),
                 "imports_external": (),
+                "language_facts": {},
                 "package": syms.package,
                 "declared_types": (),
                 "declared_types_fq": (),
@@ -258,6 +260,20 @@ def build_nodefacts_from_folder_index(
                 for v in vals or ():
                     if str(v).strip():
                         acc.add(str(v).strip())
+
+        raw_acc = node.get("__acc_imports_all_raw")
+        if isinstance(raw_acc, set):
+            for raw in (getattr(fe, "imports_all", None) or ()):
+                spec = str(raw or "").strip()
+                if spec:
+                    raw_acc.add(spec)
+
+        ext_acc = node.get("__acc_imports_external")
+        if isinstance(ext_acc, set):
+            for raw in (getattr(fe, "imports_external", None) or ()):
+                spec = str(raw or "").strip()
+                if spec:
+                    ext_acc.add(spec)
 
     for fe in fe_list:
         src_file = to_posix(str(getattr(fe, "id", "") or "").strip())
@@ -360,6 +376,38 @@ def build_nodefacts_from_folder_index(
             if isinstance(acc, set):
                 node[k] = tuple(sorted(acc))
 
+        kotlin_facts: Dict[str, Any] = {}
+
+        if node.get("package"):
+            kotlin_facts["package"] = node.get("package")
+
+        if node.get("imports_all_raw"):
+            kotlin_facts["imports"] = list(node.get("imports_all_raw") or ())
+
+        if node.get("imports_external"):
+            kotlin_facts["imports_external"] = list(node.get("imports_external") or ())
+
+        for old_key, fact_key in (
+            ("classes", "classes"),
+            ("interfaces", "interfaces"),
+            ("objects", "objects"),
+            ("enums", "enums"),
+            ("type_aliases", "type_aliases"),
+            ("functions", "functions"),
+            ("globals", "globals"),
+            ("annotations", "annotations"),
+            ("declared_types", "declared_types"),
+            ("declared_types_fq", "declared_types_fq"),
+            ("public_exports", "public_exports"),
+        ):
+            if node.get(old_key):
+                kotlin_facts[fact_key] = list(node.get(old_key) or ())
+
+        if kotlin_facts:
+            node["language_facts"] = {
+                "kotlin": kotlin_facts,
+            }
+
     nodes = {k: by_node[k] for k in sorted(by_node)}
 
     loc_total_all = int(sum(node_loc_total.values()))
@@ -368,8 +416,29 @@ def build_nodefacts_from_folder_index(
     blank_lines_total_all = int(sum(node_blank_lines_total.values()))
     comment_pct_total = (comment_lines_total_all / loc_total_all) if loc_total_all else None
 
+    nodes_with_raw_imports = sum(
+        1 for node in by_node.values()
+        if node.get("imports_all_raw")
+    )
+    raw_import_specs_total = sum(
+        len(node.get("imports_all_raw") or ())
+        for node in by_node.values()
+    )
+    nodes_with_external_imports = sum(
+        1 for node in by_node.values()
+        if node.get("imports_external")
+    )
+    external_import_specs_total = sum(
+        len(node.get("imports_external") or ())
+        for node in by_node.values()
+    )
+    nodes_with_language_facts = sum(
+        1 for node in by_node.values()
+        if node.get("language_facts")
+    )
+
     out = {
-        "schema_version": "nodefacts@v1.6",
+        "schema_version": NODEFACTS_SCHEMA,
         "language": "kotlin",
         "nodes": nodes,
         "meta": {
@@ -384,13 +453,26 @@ def build_nodefacts_from_folder_index(
             "comment_lines_total": comment_lines_total_all,
             "blank_lines_total": blank_lines_total_all,
             "comment_pct": comment_pct_total,
+            "nodes_with_imports_all_raw": int(nodes_with_raw_imports),
+            "raw_import_specs_total": int(raw_import_specs_total),
+            "nodes_with_imports_external": int(nodes_with_external_imports),
+            "external_import_specs_total": int(external_import_specs_total),
+            "nodes_with_language_facts": int(nodes_with_language_facts), 
             "kotlin_node_id_space": node_id_space,
             "used_parse_cache": bool(isinstance(parse_cache, dict) and parse_cache),
             "kotlin_file_id_to_package": dict(file_id_to_package),
         },
     }
 
-    log_event("KOTLIN:nodefacts_built", nodes=len(nodes), ms=int((time.perf_counter() - t0) * 1000))
+    log_event(
+        "KOTLIN:nodefacts_built",
+        nodes=len(nodes),
+        nodes_with_imports_all_raw=int(nodes_with_raw_imports),
+        raw_import_specs_total=int(raw_import_specs_total),
+        external_import_specs_total=int(external_import_specs_total),
+        nodes_with_language_facts=int(nodes_with_language_facts),
+        ms=int((time.perf_counter() - t0) * 1000),
+    )
     return out
 
 
@@ -423,6 +505,43 @@ def build_edges_from_folder_index(
     seen: Set[Tuple[str, str, str]] = set()
     edges: List[Dict[str, object]] = []
 
+    def _add_edge(
+        src: str,
+        dst: str,
+        kind: str,
+        confidence: float,
+        *,
+        label: Optional[str] = None,
+        spec: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> None:
+        if not src or not dst or not kind:
+            return
+        if drop_self_edges and src == dst:
+            return
+
+        key = (src, dst, kind)
+        if key in seen:
+            return
+
+        seen.add(key)
+
+        edge: Dict[str, object] = {
+            "src": src,
+            "dst": dst,
+            "kind": kind,
+            "confidence": float(confidence),
+            "weight": float(confidence),
+        }
+        if label:
+            edge["label"] = label
+        if spec:
+            edge["spec"] = spec
+        if reason:
+            edge["reason"] = reason
+
+        edges.append(edge)
+
     for fe in (getattr(idx, "files", {}) or {}).values():
         if not isinstance(fe, FileEntry):
             continue
@@ -439,18 +558,13 @@ def build_edges_from_folder_index(
             if not dst or (drop_self_edges and src == dst):
                 continue
 
-            kind = "kotlin:import:internal"
-            key = (src, dst, kind)
-            if key in seen:
-                continue
-
-            seen.add(key)
-            edges.append({
-                "src": src,
-                "dst": dst,
-                "kind": kind,
-                "confidence": 0.5,
-            })
+            _add_edge(
+                src,
+                dst,
+                "kotlin:import:internal",
+                0.5,
+                reason="kotlin_import_internal",
+            )
 
         # -------------------------
         # SYMBOL EDGES
@@ -460,19 +574,14 @@ def build_edges_from_folder_index(
             if not dst or (drop_self_edges and src == dst):
                 continue
 
-            kind = "kotlin:symbol:internal"
-            key = (src, dst, kind)
-            if key in seen:
-                continue
-
-            seen.add(key)
-            edges.append({
-                "src": src,
-                "dst": dst,
-                "kind": kind,
-                "confidence": 0.65,
-            })
-
+            _add_edge(
+                src,
+                dst,
+                "kotlin:symbol:internal",
+                0.65,
+                reason="kotlin_symbol_internal",
+            )
+            
     edges.sort(
         key=lambda e: (
             str(e.get("kind", "")),
