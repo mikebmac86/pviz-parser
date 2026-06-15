@@ -3,8 +3,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .models import JavaImport, JavaParsedFile
 from .regex_engine import _count_loc_code  # reuse LOC counter for now
@@ -48,8 +49,19 @@ def _timeout_s() -> int:
     return _env_int("PVIZ_JAVAPARSER_TIMEOUT_S", 30)
 
 
+def _batch_timeout_s() -> int:
+    # Larger default because this parses many files in one JVM.
+    return _env_int("PVIZ_JAVAPARSER_BATCH_TIMEOUT_S", 900)
+
+
 def _debug_enabled() -> bool:
     return _env_bool("PVIZ_JAVAPARSER_DEBUG", False)
+
+
+def _batch_enabled() -> bool:
+    # Default true. If the deployed jar does not support --file-list yet,
+    # the wrapper falls back to per-file mode.
+    return _env_bool("PVIZ_JAVAPARSER_BATCH", True)
 
 
 def _invoke_mode() -> str:
@@ -85,8 +97,8 @@ def _root_for_symbol_solving() -> Optional[Path]:
     """
     Optional repo root forwarded to the Java CLI as --root.
 
-    Keep this explicit. Do not guess from individual file paths here because the
-    parser wrapper does not reliably know the scan root.
+    This env-based root takes precedence over the repo_root argument passed to
+    parse_java_files(...), which keeps SaaS runtime overrides explicit.
     """
     v = _env("PVIZ_JAVAPARSER_ROOT", "")
     if not v:
@@ -104,14 +116,31 @@ def _root_for_symbol_solving() -> Optional[Path]:
     return p
 
 
+def _effective_root(repo_root: Optional[Path]) -> Optional[Path]:
+    env_root = _root_for_symbol_solving()
+    if env_root is not None:
+        return env_root
+
+    if repo_root is None:
+        return None
+
+    p = Path(repo_root).expanduser()
+    try:
+        p = p.resolve()
+    except Exception:
+        pass
+
+    if not p.exists() or not p.is_dir():
+        raise JavaParserUnavailable(f"repo_root points to missing/non-directory path: {p}")
+
+    return p
+
+
 def _jar_path() -> Path:
     """
     SaaS/runtime contract:
 
       PVIZ_JAVAPARSER_JAR must point to the JavaParser CLI fat jar.
-
-    The Dockerfile already copies the jar to a stable path, so do not search
-    random fallback locations. Fail loudly if the env var is missing or wrong.
     """
     jar = _env("PVIZ_JAVAPARSER_JAR", "")
     if not jar:
@@ -135,10 +164,10 @@ def _jar_path() -> Path:
 # CLI invocation
 # ---------------------------------------------------------------------------
 
-def _cli_args(file_path: Path) -> List[str]:
-    args = ["--file", str(file_path)]
+def _common_cli_args(*, repo_root: Optional[Path]) -> List[str]:
+    args: List[str] = []
 
-    root = _root_for_symbol_solving()
+    root = _effective_root(repo_root)
     if root is not None:
         args.extend(["--root", str(root)])
 
@@ -153,12 +182,41 @@ def _cli_args(file_path: Path) -> List[str]:
     return args
 
 
-def _cmd_jar(java: str, jar: Path, file_path: Path) -> List[str]:
-    return [java, "-jar", str(jar), *_cli_args(file_path)]
+def _cli_args_file(file_path: Path, *, repo_root: Optional[Path] = None) -> List[str]:
+    return ["--file", str(file_path), *_common_cli_args(repo_root=repo_root)]
 
 
-def _cmd_classpath(java: str, jar: Path, file_path: Path) -> List[str]:
-    return [java, "-cp", str(jar), _main_class(), *_cli_args(file_path)]
+def _cli_args_file_list(
+    file_list_path: Path,
+    *,
+    repo_root: Optional[Path] = None,
+) -> List[str]:
+    """
+    New jar contract.
+
+    Expected Java CLI behavior:
+      --file-list <txt file containing one path per line>
+      --format jsonl
+
+    stdout may be either:
+      - JSONL: one object per parsed file
+      - JSON: {"files":[...]} or {"results":[...]} or [...]
+    """
+    return [
+        "--file-list",
+        str(file_list_path),
+        "--format",
+        "jsonl",
+        *_common_cli_args(repo_root=repo_root),
+    ]
+
+
+def _cmd_jar(java: str, jar: Path, cli_args: List[str]) -> List[str]:
+    return [java, "-jar", str(jar), *cli_args]
+
+
+def _cmd_classpath(java: str, jar: Path, cli_args: List[str]) -> List[str]:
+    return [java, "-cp", str(jar), _main_class(), *cli_args]
 
 
 def _run_cmd(cmd: List[str], timeout_s: int) -> Tuple[int, str, str]:
@@ -192,6 +250,22 @@ def _looks_like_jar_invocation_problem(stdout: str, stderr: str) -> bool:
     )
 
 
+def _looks_like_batch_unsupported(stdout: str, stderr: str) -> bool:
+    text = f"{stdout}\n{stderr}".lower()
+    return any(
+        needle in text
+        for needle in (
+            "unknown option",
+            "unrecognized option",
+            "file-list",
+            "--file-list",
+            "usage:",
+            "missing required option: file",
+            "missing required option --file",
+        )
+    )
+
+
 def _decode_json_output(cmd: List[str], rc: int, out: str, err: str) -> Dict[str, Any]:
     if not out and rc != 0:
         raise JavaParserUnavailable(
@@ -219,48 +293,146 @@ def _decode_json_output(cmd: List[str], rc: int, out: str, err: str) -> Dict[str
     return data
 
 
-def _run_javaparser_cli(file_path: Path) -> Dict[str, Any]:
+def _run_cli_args(cli_args: List[str], *, timeout_s: int) -> Tuple[List[str], int, str, str]:
     jar = _jar_path()
     java = _java_bin()
-    timeout_s = _timeout_s()
     mode = _invoke_mode()
 
     if mode == "jar":
-        cmd = _cmd_jar(java, jar, file_path)
+        cmd = _cmd_jar(java, jar, cli_args)
         rc, out, err = _run_cmd(cmd, timeout_s)
-        return _decode_json_output(cmd, rc, out, err)
+        return cmd, rc, out, err
 
     if mode == "classpath":
-        cmd = _cmd_classpath(java, jar, file_path)
+        cmd = _cmd_classpath(java, jar, cli_args)
         rc, out, err = _run_cmd(cmd, timeout_s)
-        return _decode_json_output(cmd, rc, out, err)
+        return cmd, rc, out, err
 
-    # auto mode: try executable jar first, then classpath fallback if the jar
-    # lacks a manifest/main-class.
-    jar_cmd = _cmd_jar(java, jar, file_path)
+    jar_cmd = _cmd_jar(java, jar, cli_args)
     rc, out, err = _run_cmd(jar_cmd, timeout_s)
 
     if out:
-        try:
-            return _decode_json_output(jar_cmd, rc, out, err)
-        except JavaParserUnavailable:
-            if not _looks_like_jar_invocation_problem(out, err):
-                raise
+        # Return output to caller. JSON decode happens at the caller layer.
+        return jar_cmd, rc, out, err
 
     if rc != 0 and (_looks_like_jar_invocation_problem(out, err) or not out):
-        cp_cmd = _cmd_classpath(java, jar, file_path)
+        cp_cmd = _cmd_classpath(java, jar, cli_args)
         rc2, out2, err2 = _run_cmd(cp_cmd, timeout_s)
+        return cp_cmd, rc2, out2, err2
 
+    return jar_cmd, rc, out, err
+
+
+def _run_javaparser_cli(file_path: Path, *, repo_root: Optional[Path] = None) -> Dict[str, Any]:
+    cli_args = _cli_args_file(file_path, repo_root=repo_root)
+    cmd, rc, out, err = _run_cli_args(cli_args, timeout_s=_timeout_s())
+
+    try:
+        return _decode_json_output(cmd, rc, out, err)
+    except JavaParserUnavailable as e:
+        raise JavaParserUnavailable(
+            f"javaparser single-file cli failed. cmd={cmd!r} rc={rc} stderr={err[:1000]} error={e}"
+        ) from e
+
+
+def _decode_batch_output(cmd: List[str], rc: int, out: str, err: str) -> List[Dict[str, Any]]:
+    if not out and rc != 0:
+        raise JavaParserUnavailable(
+            f"javaparser batch cli failed cmd={cmd!r} rc={rc}: stderr={err[:2000]}"
+        )
+
+    if not out:
+        raise JavaParserUnavailable(
+            f"javaparser batch cli produced no output cmd={cmd!r} rc={rc}: stderr={err[:2000]}"
+        )
+
+    # Prefer JSONL. This lets the jar stream one file result per line.
+    rows: List[Dict[str, Any]] = []
+    jsonl_ok = True
+
+    for line in out.splitlines():
+        s = line.strip()
+        if not s:
+            continue
         try:
-            return _decode_json_output(cp_cmd, rc2, out2, err2)
-        except JavaParserUnavailable as e:
-            raise JavaParserUnavailable(
-                "javaparser cli failed in both jar and classpath modes. "
-                f"jar_cmd={jar_cmd!r} jar_rc={rc} jar_stdout={out[:1000]} jar_stderr={err[:1000]} "
-                f"classpath_cmd={cp_cmd!r} classpath_error={e}"
-            ) from e
+            item = json.loads(s)
+        except Exception:
+            jsonl_ok = False
+            rows = []
+            break
 
-    return _decode_json_output(jar_cmd, rc, out, err)
+        if isinstance(item, dict):
+            rows.append(item)
+        else:
+            jsonl_ok = False
+            rows = []
+            break
+
+    if jsonl_ok and rows:
+        return rows
+
+    # Also accept aggregate JSON for early/simple jar implementation.
+    try:
+        data = json.loads(out)
+    except Exception as e:
+        raise JavaParserUnavailable(
+            f"javaparser batch cli returned non-json output cmd={cmd!r} rc={rc}: "
+            f"stdout={out[:2000]} stderr={err[:2000]}"
+        ) from e
+
+    if isinstance(data, list):
+        return [x for x in data if isinstance(x, dict)]
+
+    if isinstance(data, dict):
+        for key in ("files", "results", "parsed", "items"):
+            v = data.get(key)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+
+        # Accept one object as a degenerate one-file result.
+        if data.get("file") or data.get("path"):
+            return [data]
+
+    raise JavaParserUnavailable(
+        f"javaparser batch cli returned unsupported JSON shape cmd={cmd!r}: stdout={out[:2000]}"
+    )
+
+
+def _run_javaparser_cli_batch(
+    paths: Sequence[Path],
+    *,
+    repo_root: Optional[Path],
+) -> List[Dict[str, Any]]:
+    if not paths:
+        return []
+
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        suffix=".java-files.txt",
+        delete=False,
+    ) as f:
+        list_path = Path(f.name)
+        for p in paths:
+            f.write(str(Path(p).resolve()))
+            f.write("\n")
+
+    try:
+        cli_args = _cli_args_file_list(list_path, repo_root=repo_root)
+        cmd, rc, out, err = _run_cli_args(cli_args, timeout_s=_batch_timeout_s())
+
+        if rc != 0 and _looks_like_batch_unsupported(out, err):
+            raise JavaParserUnavailable(
+                f"javaparser batch mode appears unsupported by jar. cmd={cmd!r} stderr={err[:1000]}"
+            )
+
+        return _decode_batch_output(cmd, rc, out, err)
+
+    finally:
+        try:
+            list_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -430,96 +602,95 @@ def _error_snippet(prefix: str, msg: str) -> str:
     return f"{prefix}: {msg}"[:limit]
 
 
-# ---------------------------------------------------------------------------
-# Public parser
-# ---------------------------------------------------------------------------
+def _read_loc_code(path: Path) -> Optional[int]:
+    try:
+        try:
+            raw = Path(path).read_text("utf-8")
+        except UnicodeDecodeError:
+            raw = Path(path).read_text("latin-1", errors="replace")
+        return _count_loc_code(raw)
+    except Exception:
+        return None
 
-def parse_java_file(path: Path) -> JavaParsedFile:
-    """
-    JavaParser-backed parse.
 
-    Never raises. Returns parse_status="error" on failures, allowing engine.py
-    to decide whether to fall back to regex in auto mode.
-    """
+def _path_from_batch_item(
+    data: Dict[str, Any],
+    *,
+    repo_root: Optional[Path],
+    fallback: Optional[Path] = None,
+) -> Path:
+    raw = data.get("path") or data.get("file") or data.get("filename")
+
+    if isinstance(raw, str) and raw.strip():
+        s = raw.strip()
+        p = Path(s)
+
+        if p.is_absolute():
+            return p
+
+        root = repo_root
+        if root is not None:
+            return Path(root) / p
+
+        return p
+
+    if fallback is not None:
+        return Path(fallback)
+
+    return Path("")
+
+
+def _parsed_file_from_data(
+    path: Path,
+    data: Dict[str, Any],
+    *,
+    loc_code: Optional[int] = None,
+) -> JavaParsedFile:
     status = "ok"
     err: Optional[str] = None
 
-    pkg: Optional[str] = None
-    classes: List[str] = []
-    functions: List[str] = []
+    ok = bool(data.get("ok", True))
+    if not ok:
+        status = "error"
+        err = str(data.get("error") or "javaparser cli reported ok=false")[
+            : 1200 if _debug_enabled() else 200
+        ]
+
+    cli_parse_status = data.get("parse_status")
+    if status == "ok" and isinstance(cli_parse_status, str):
+        ps = cli_parse_status.strip().lower()
+        if ps in {"ok", "warn", "error", "partial"}:
+            status = ps
+
+    pkg = data.get("package") if isinstance(data.get("package"), str) else None
+
+    classes = _to_str_list(data.get("declared_types")) or _to_str_list(data.get("types"))
+    functions = _to_str_list(data.get("methods"))
+
     globals_: List[str] = []
-    exports: List[str] = []
-    loc_code: Optional[int] = None
+    globals_.extend(_to_str_list(data.get("fields")))
+    globals_.extend(_to_str_list(data.get("enum_constants")))
+    globals_.extend(_to_str_list(data.get("record_components")))
 
-    imports: Optional[List[JavaImport]] = None
-    imports_raw: Optional[List[str]] = None
-    imports_static: Optional[List[str]] = None
-    imports_wildcard: Optional[List[str]] = None
-    classes_fq: Optional[List[str]] = None
-    annotations: Optional[Dict[str, int]] = None
-    decl_annotations: Optional[Dict[str, List[str]]] = None
+    ex = data.get("exports")
+    exports = _to_str_list(ex) if isinstance(ex, list) else []
 
-    try:
-        file_path = Path(path)
+    if not exports:
+        exports = list(classes)
 
-        try:
-            raw = file_path.read_text("utf-8")
-        except UnicodeDecodeError:
-            raw = file_path.read_text("latin-1", errors="replace")
+    imports, imports_raw, imports_static, imports_wildcard = _parse_imports(data)
+    annotations, decl_annotations = _parse_annotations(data)
 
-        loc_code = _count_loc_code(raw)
+    classes = _dedupe_sorted(classes)
+    functions = _dedupe_sorted(functions)
+    globals_ = _dedupe_sorted(globals_)
+    exports = _dedupe_sorted(exports)
 
-        data = _run_javaparser_cli(file_path)
-
-        ok = bool(data.get("ok", True))
-        if not ok:
-            status = "error"
-            err = str(data.get("error") or "javaparser cli reported ok=false")[
-                : 1200 if _debug_enabled() else 200
-            ]
-
-        cli_parse_status = data.get("parse_status")
-        if status == "ok" and isinstance(cli_parse_status, str):
-            ps = cli_parse_status.strip().lower()
-            if ps in {"ok", "warn", "error", "partial"}:
-                status = ps
-
-        pkg = data.get("package") if isinstance(data.get("package"), str) else None
-
-        classes = _to_str_list(data.get("declared_types")) or _to_str_list(data.get("types"))
-        functions = _to_str_list(data.get("methods"))
-
-        globals_.extend(_to_str_list(data.get("fields")))
-        globals_.extend(_to_str_list(data.get("enum_constants")))
-        globals_.extend(_to_str_list(data.get("record_components")))
-
-        ex = data.get("exports")
-        exports = _to_str_list(ex) if isinstance(ex, list) else []
-
-        if not exports:
-            exports = list(classes)
-
-        imports, imports_raw, imports_static, imports_wildcard = _parse_imports(data)
-        annotations, decl_annotations = _parse_annotations(data)
-
-        classes = _dedupe_sorted(classes)
-        functions = _dedupe_sorted(functions)
-        globals_ = _dedupe_sorted(globals_)
-        exports = _dedupe_sorted(exports)
-
-        classes_fq_from_jar = _to_str_list(data.get("declared_types_fq"))
-        if classes_fq_from_jar:
-            classes_fq = _dedupe_sorted(classes_fq_from_jar)
-        else:
-            classes_fq = _compute_classes_fq(pkg, classes)
-
-    except JavaParserUnavailable as e:
-        status = "error"
-        err = _error_snippet("JavaParserUnavailable", str(e))
-
-    except Exception as e:
-        status = "error"
-        err = _error_snippet(type(e).__name__, str(e))
+    classes_fq_from_jar = _to_str_list(data.get("declared_types_fq"))
+    if classes_fq_from_jar:
+        classes_fq = _dedupe_sorted(classes_fq_from_jar)
+    else:
+        classes_fq = _compute_classes_fq(pkg, classes)
 
     return JavaParsedFile(
         path=Path(path),
@@ -539,3 +710,131 @@ def parse_java_file(path: Path) -> JavaParsedFile:
         annotations=annotations,
         decl_annotations=decl_annotations,
     )
+
+
+def _error_parsed_file(path: Path, message: str) -> JavaParsedFile:
+    return JavaParsedFile(
+        path=Path(path),
+        parse_status="error",
+        error_snippet=_error_snippet("JavaParserUnavailable", message),
+        package=None,
+        classes=[],
+        functions=[],
+        globals=[],
+        all_exports=[],
+        loc_code=_read_loc_code(path),
+        imports=None,
+        imports_raw=None,
+        imports_static=None,
+        imports_wildcard=None,
+        classes_fq=None,
+        annotations=None,
+        decl_annotations=None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public parser
+# ---------------------------------------------------------------------------
+
+def parse_java_file(path: Path, *, repo_root: Optional[Path] = None) -> JavaParsedFile:
+    """
+    JavaParser-backed single-file parse.
+
+    Never raises. Returns parse_status="error" on failures, allowing engine.py
+    to decide whether to fall back to regex in auto mode.
+    """
+    try:
+        file_path = Path(path)
+        loc_code = _read_loc_code(file_path)
+        data = _run_javaparser_cli(file_path, repo_root=repo_root)
+        return _parsed_file_from_data(file_path, data, loc_code=loc_code)
+
+    except JavaParserUnavailable as e:
+        return _error_parsed_file(Path(path), str(e))
+
+    except Exception as e:
+        return _error_parsed_file(Path(path), f"{type(e).__name__}: {e}")
+
+
+def parse_java_files(
+    paths: Sequence[Path],
+    *,
+    repo_root: Optional[Path] = None,
+) -> Dict[str, JavaParsedFile]:
+    """
+    JavaParser-backed batch parse.
+
+    Preferred behavior:
+      - invoke jar once with --file-list
+      - parse JSONL or aggregate JSON
+      - return parsed results for all files
+
+    Fallback behavior:
+      - if batch mode is disabled or unsupported, call per-file mode
+      - this preserves compatibility with the current jar until batch support is added
+    """
+    files = [Path(p) for p in paths]
+    out: Dict[str, JavaParsedFile] = {}
+
+    if not files:
+        return out
+
+    if not _batch_enabled() or len(files) == 1:
+        for p in files:
+            out[str(p)] = parse_java_file(p, repo_root=repo_root)
+        return out
+
+    try:
+        effective_root = _effective_root(repo_root)
+        rows = _run_javaparser_cli_batch(files, repo_root=effective_root)
+
+        # Map original files by absolute string so we can preserve missing/error results.
+        original_by_abs: Dict[str, Path] = {}
+        for p in files:
+            try:
+                original_by_abs[str(p.resolve())] = p
+            except Exception:
+                original_by_abs[str(p)] = p
+
+        seen_abs: set[str] = set()
+
+        for row in rows:
+            result_path = _path_from_batch_item(row, repo_root=effective_root)
+            if not str(result_path):
+                continue
+
+            try:
+                abs_key = str(result_path.resolve())
+            except Exception:
+                abs_key = str(result_path)
+
+            seen_abs.add(abs_key)
+
+            loc_code = _read_loc_code(result_path)
+            pf = _parsed_file_from_data(result_path, row, loc_code=loc_code)
+            out[str(result_path)] = pf
+
+        # Fill missing files as errors so the caller has one result per input.
+        for abs_key, original in original_by_abs.items():
+            if abs_key not in seen_abs:
+                out[str(original)] = _error_parsed_file(
+                    original,
+                    "javaparser batch did not return a result for this file",
+                )
+
+        return out
+
+    except JavaParserUnavailable:
+        # Current deployed jar may not support --file-list yet.
+        # Fall back to per-file JavaParser mode instead of breaking the build.
+        for p in files:
+            out[str(p)] = parse_java_file(p, repo_root=repo_root)
+        return out
+
+    except Exception as e:
+        # Unexpected batch wrapper issue. Return per-file errors rather than raising.
+        msg = f"{type(e).__name__}: {e}"
+        for p in files:
+            out[str(p)] = _error_parsed_file(p, msg)
+        return out

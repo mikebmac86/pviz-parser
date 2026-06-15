@@ -5,9 +5,13 @@ from __future__ import annotations
 FolderIndex — deterministic snapshot of a workspace's Java files.
 
 ENHANCED:
-  - Parallel parsing with ProcessPoolExecutor
+  - Uses JavaParser batch/file-list parsing when java_use_jar_imports=True
+  - Keeps serial/parallel per-file parsing as fallback / non-JavaParser path
+  - Applies include_tests filtering in both full-repo and bucket-file modes
+  - Adds progress diagnostics for both batch and fallback paths
+  - Adds slow-file diagnostics for fallback per-file parsing
   - Caches JavaParsedFile objects for reuse in build_artifacts.py
-  - Uses parser-provided imports instead of regex
+  - Uses parser-provided imports instead of regex when available
   - Adds import classification:
       internal
       internal_unresolved
@@ -36,7 +40,7 @@ from analyzer.java.java_canonical import (
     build_fq_typename,
 )
 
-from analyzer.java.java_parse import parse_java_file
+from analyzer.java.java_parse import parse_java_file, parse_java_files
 from analyzer.java.java_parse import JavaParsedFile
 
 try:
@@ -52,7 +56,7 @@ except Exception:  # pragma: no cover
 
 def _diag_print(name: str, **k) -> None:
     parts = " ".join(f"{kk}={k[kk]!r}" for kk in sorted(k.keys()))
-    print(f"[JAVA_DIAG] {name} {parts}".rstrip())
+    print(f"[JAVA_DIAG] {name} {parts}".rstrip(), flush=True)
 
 
 def _diag_sample_map(m: Mapping, *, max_items: int = 5) -> Dict[str, object]:
@@ -87,6 +91,7 @@ _STDLIB_PREFIXES = (
     "com.sun.",
 )
 
+
 def _tuple_strs(value: object) -> Tuple[str, ...]:
     """
     Normalize a JSON-loaded sequence into tuple[str, ...].
@@ -118,20 +123,54 @@ def _mapping_or_empty(value: object) -> Mapping[str, object]:
         return value
     return {}
 
+
+def _is_test_java_path(path: Path, root: Optional[Path] = None) -> bool:
+    """
+    Test-source detector used by both:
+      - full repo walk mode
+      - bucket-provided file mode
+
+    Keep this intentionally conservative. It excludes common Java test/source
+    roots and common test class filename patterns when include_tests=False.
+    """
+    try:
+        rel = repo_rel(path, root) if root is not None else str(path)
+    except Exception:
+        rel = str(path)
+
+    s = "/" + to_posix(str(rel)).lower().lstrip("/")
+    name = path.name.lower()
+
+    return (
+        "/src/test/java/" in s
+        or "/src/integrationtest/java/" in s
+        or "/src/integration-test/java/" in s
+        or "/src/it/java/" in s
+        or "/src/jmh/java/" in s
+        or "/test/" in s
+        or "/tests/" in s
+        or name.endswith("test.java")
+        or name.endswith("tests.java")
+        or name.startswith("test")
+    )
+
+
 def _iter_java_files(root: Path, *, include_tests: bool = True) -> List[Path]:
     root = root.resolve()
     out: List[Path] = []
+
     try:
         for p in root.rglob("*.java"):
             if not p.is_file():
                 continue
-            if not include_tests:
-                s = to_posix(str(p)).lower()
-                if "/test/" in s or p.name.lower().endswith("test.java"):
-                    continue
+
+            if not include_tests and _is_test_java_path(p, root):
+                continue
+
             out.append(p.resolve())
     except Exception:
         pass
+
     return sorted(set(out), key=lambda p: to_posix(str(p)))
 
 
@@ -141,21 +180,6 @@ def _count_java_metrics(text: str) -> Tuple[int, int, int, int, Optional[float]]
 
     Returns:
         loc, sloc, comment_lines, blank_lines, comment_pct
-
-    loc:
-        Physical line count, including blanks.
-
-    sloc:
-        Lines containing code after stripping comments.
-
-    comment_lines:
-        Comment-only physical lines.
-
-    blank_lines:
-        Blank / whitespace-only physical lines.
-
-    comment_pct:
-        comment_lines / loc
     """
     loc = 0
     sloc = 0
@@ -221,11 +245,25 @@ def _dedupe_preserve(seq: Sequence[str]) -> List[str]:
     return out
 
 
-def _chunk_files(files: List[Path], max_workers: int) -> List[List[Path]]:
-    if not files or max_workers <= 1:
+def _chunk_files(
+    files: List[Path],
+    max_workers: int,
+    *,
+    target_chunk_size: int = 25,
+) -> List[List[Path]]:
+    """
+    Create small batches so fallback parse progress is visible.
+
+    This is only used by the fallback per-file path. The JavaParser path should
+    normally use parse_java_files(...) once for the entire file list.
+    """
+    if not files:
+        return []
+
+    if max_workers <= 1:
         return [files]
 
-    chunk_size = max(1, len(files) // max_workers)
+    chunk_size = max(1, int(target_chunk_size))
     chunks: List[List[Path]] = []
 
     for i in range(0, len(files), chunk_size):
@@ -324,11 +362,47 @@ def _metadata_from_file(path: Path) -> Tuple[int, int, int, int, Optional[float]
         return 0, 0, 0, 0, None, 0, "", ""
 
 
+def _file_too_large_parsed_file(path: Path, size_bytes: int) -> JavaParsedFile:
+    return JavaParsedFile(
+        path=path,
+        parse_status="error",
+        error_snippet=f"file_too_large:{size_bytes}",
+        package=None,
+        classes=[],
+        functions=[],
+        globals=[],
+        all_exports=[],
+        loc_code=None,
+    )
+
+
+def _missing_batch_parsed_file(path: Path) -> JavaParsedFile:
+    return JavaParsedFile(
+        path=path,
+        parse_status="error",
+        error_snippet="missing_from_javaparser_batch",
+        package=None,
+        classes=[],
+        functions=[],
+        globals=[],
+        all_exports=[],
+        loc_code=None,
+    )
+
+
 def _parse_files_batch(
     repo_root_str: str,
     paths: List[Path],
     max_bytes: Optional[int],
+    slow_file_ms: int = 5000,
 ) -> Dict[str, Tuple[JavaParsedFile, int, int, int, int, Optional[float], int, str, str]]:
+    """
+    Fallback per-file parser batch.
+
+    This is intentionally retained for regex mode / non-batch mode, but the
+    JavaParser jar path should normally avoid this and use parse_java_files(...)
+    once with the whole file list.
+    """
     repo_root = Path(repo_root_str)
     results: Dict[str, Tuple[JavaParsedFile, int, int, int, int, Optional[float], int, str, str]] = {}
 
@@ -345,17 +419,7 @@ def _parse_files_batch(
                 mtime_iso = ""
 
             if isinstance(max_bytes, int) and max_bytes > 0 and size_bytes > max_bytes:
-                pf = JavaParsedFile(
-                    path=path,
-                    parse_status="error",
-                    error_snippet=f"file_too_large:{size_bytes}",
-                    package=None,
-                    classes=[],
-                    functions=[],
-                    globals=[],
-                    all_exports=[],
-                    loc_code=None,
-                )
+                pf = _file_too_large_parsed_file(path, size_bytes)
                 results[rel_file] = (pf, 0, 0, 0, 0, None, size_bytes, str(mtime_iso), str(short_hash))
                 continue
 
@@ -365,7 +429,22 @@ def _parse_files_batch(
                 text = data.decode("latin-1", errors="replace")
 
             loc, sloc, comment_lines, blank_lines, comment_pct = _count_java_metrics(text)
+
+            t_one = time.perf_counter()
             pf = parse_java_file(path)
+            one_ms = int((time.perf_counter() - t_one) * 1000)
+
+            if slow_file_ms > 0 and one_ms >= slow_file_ms:
+                try:
+                    _diag_print(
+                        "fallback_parse_slow_file",
+                        file=rel_file,
+                        ms=one_ms,
+                        status=getattr(pf, "parse_status", ""),
+                        error=str(getattr(pf, "error_snippet", "") or "")[:200],
+                    )
+                except Exception:
+                    pass
 
             results[rel_file] = (
                 pf,
@@ -472,6 +551,422 @@ def _safe_int_hash(hash_str: str) -> Optional[int]:
         return None
 
 
+def _normalize_batch_results(
+    *,
+    batch_parsed: Mapping[str, JavaParsedFile],
+    root: Path,
+) -> Tuple[Dict[str, JavaParsedFile], Dict[str, JavaParsedFile]]:
+    """
+    Build lookup maps for batch parser results.
+
+    Returns:
+      parsed_by_abs:
+        absolute path string -> JavaParsedFile
+
+      parsed_by_key:
+        assorted POSIX keys -> JavaParsedFile
+        includes original returned key and repo-relative path when possible
+    """
+    parsed_by_abs: Dict[str, JavaParsedFile] = {}
+    parsed_by_key: Dict[str, JavaParsedFile] = {}
+
+    for key, pf in batch_parsed.items():
+        if not isinstance(pf, JavaParsedFile):
+            continue
+
+        try:
+            parsed_by_abs[str(Path(pf.path).resolve())] = pf
+        except Exception:
+            pass
+
+        try:
+            parsed_by_key[to_posix(str(key))] = pf
+        except Exception:
+            pass
+
+        try:
+            parsed_by_key[to_posix(str(Path(pf.path)))] = pf
+        except Exception:
+            pass
+
+        try:
+            parsed_by_key[to_posix(repo_rel(Path(pf.path), root))] = pf
+        except Exception:
+            pass
+
+    return parsed_by_abs, parsed_by_key
+
+
+def _build_from_javaparser_batch(
+    *,
+    root: Path,
+    java_files: List[Path],
+    max_bytes: Optional[int],
+) -> Tuple[Dict[str, JavaParsedFile], Dict[str, Tuple[int, int, int, int, Optional[float], int, str, str]]]:
+    """
+    Primary JavaParser path.
+
+    This hands the full Java file list to parse_java_files(...), which should
+    invoke the JavaParser jar once using file-list/batch mode.
+    """
+    parsed_by_rel: Dict[str, JavaParsedFile] = {}
+    file_metadata: Dict[str, Tuple[int, int, int, int, Optional[float], int, str, str]] = {}
+
+    t_parse = time.perf_counter()
+
+    log_event("JAVA_FOLDER_INDEX:parse_javaparser_batch", files=len(java_files))
+    try:
+        _diag_print(
+            "parse_javaparser_batch_begin",
+            files=len(java_files),
+            repo_root=str(root),
+        )
+    except Exception:
+        pass
+
+    eligible_for_parse: List[Path] = []
+
+    skipped_too_large = 0
+    for path in java_files:
+        rel_file = to_posix(repo_rel(path, root))
+        meta = _metadata_from_file(path)
+        file_metadata[rel_file] = meta
+
+        size_bytes = meta[5]
+        if isinstance(max_bytes, int) and max_bytes > 0 and size_bytes > max_bytes:
+            parsed_by_rel[rel_file] = _file_too_large_parsed_file(path, size_bytes)
+            skipped_too_large += 1
+            continue
+
+        eligible_for_parse.append(path)
+
+    try:
+        _diag_print(
+            "parse_javaparser_batch_prepared",
+            total=len(java_files),
+            eligible=len(eligible_for_parse),
+            skipped_too_large=skipped_too_large,
+        )
+    except Exception:
+        pass
+
+    batch_parsed: Dict[str, JavaParsedFile] = {}
+    batch_error: Optional[str] = None
+
+    try:
+        batch_parsed = parse_java_files(eligible_for_parse, repo_root=root)
+    except Exception as e:
+        batch_error = f"{type(e).__name__}:{str(e)[:300]}"
+        log_event(
+            "JAVA_FOLDER_INDEX:parse_javaparser_batch_error",
+            files=len(eligible_for_parse),
+            error=batch_error,
+        )
+        try:
+            _diag_print(
+                "parse_javaparser_batch_error",
+                files=len(eligible_for_parse),
+                exc_type=type(e).__name__,
+                exc=str(e)[:300],
+            )
+        except Exception:
+            pass
+
+    parsed_by_abs, parsed_by_key = _normalize_batch_results(
+        batch_parsed=batch_parsed,
+        root=root,
+    )
+
+    missing = 0
+
+    for path in eligible_for_parse:
+        rel_file = to_posix(repo_rel(path, root))
+
+        try:
+            abs_key = str(path.resolve())
+        except Exception:
+            abs_key = str(path)
+
+        pf = (
+            parsed_by_abs.get(abs_key)
+            or parsed_by_key.get(to_posix(str(path)))
+            or parsed_by_key.get(rel_file)
+        )
+
+        if pf is None:
+            missing += 1
+            if batch_error:
+                pf = JavaParsedFile(
+                    path=path,
+                    parse_status="error",
+                    error_snippet=f"javaparser_batch_failed:{batch_error}",
+                    package=None,
+                    classes=[],
+                    functions=[],
+                    globals=[],
+                    all_exports=[],
+                    loc_code=None,
+                )
+            else:
+                pf = _missing_batch_parsed_file(path)
+
+        parsed_by_rel[rel_file] = pf
+
+    elapsed_ms = int((time.perf_counter() - t_parse) * 1000)
+    ok = sum(1 for pf in parsed_by_rel.values() if getattr(pf, "parse_status", None) == "ok")
+    err = len(parsed_by_rel) - ok
+
+    log_event(
+        "JAVA_FOLDER_INDEX:parse_javaparser_batch_done",
+        files=len(java_files),
+        eligible=len(eligible_for_parse),
+        parsed=len(parsed_by_rel),
+        returned=len(batch_parsed),
+        missing=missing,
+        skipped_too_large=skipped_too_large,
+        ok=ok,
+        err=err,
+        ms=elapsed_ms,
+    )
+
+    try:
+        _diag_print(
+            "parse_javaparser_batch_done",
+            files=len(java_files),
+            eligible=len(eligible_for_parse),
+            parsed=len(parsed_by_rel),
+            returned=len(batch_parsed),
+            missing=missing,
+            skipped_too_large=skipped_too_large,
+            ok=ok,
+            err=err,
+            elapsed_ms=elapsed_ms,
+        )
+    except Exception:
+        pass
+
+    return parsed_by_rel, file_metadata
+
+
+def _build_from_fallback_per_file(
+    *,
+    root: Path,
+    java_files: List[Path],
+    cfg,
+    max_bytes: Optional[int],
+    target_chunk_size: int,
+    slow_file_ms: int,
+) -> Tuple[Dict[str, JavaParsedFile], Dict[str, Tuple[int, int, int, int, Optional[float], int, str, str]]]:
+    """
+    Fallback parsing path.
+
+    This preserves the existing serial/parallel behavior for regex mode,
+    explicitly disabled JavaParser mode, or emergency fallback.
+    """
+    parsed_by_rel: Dict[str, JavaParsedFile] = {}
+    file_metadata: Dict[str, Tuple[int, int, int, int, Optional[float], int, str, str]] = {}
+
+    cpu_count = os.cpu_count() or 1
+    max_workers = getattr(cfg, "max_workers", cpu_count)
+    max_workers = min(max(1, int(max_workers)), len(java_files) or 1)
+
+    try:
+        _diag_print("fallback_parse_plan", cpu_count=cpu_count, max_workers=max_workers, files=len(java_files))
+    except Exception:
+        pass
+
+    if max_workers <= 1 or len(java_files) < 10:
+        log_event("JAVA_FOLDER_INDEX:fallback_parse_serial", files=len(java_files))
+        t_parse = time.perf_counter()
+
+        batch_results = _parse_files_batch(str(root), java_files, max_bytes, slow_file_ms)
+        for rel_file, (
+            pf,
+            loc,
+            sloc,
+            comment_lines,
+            blank_lines,
+            comment_pct,
+            size,
+            mtime,
+            hash_str,
+        ) in batch_results.items():
+            rel_norm = to_posix(rel_file)
+            parsed_by_rel[rel_norm] = pf
+            file_metadata[rel_norm] = (
+                loc,
+                sloc,
+                comment_lines,
+                blank_lines,
+                comment_pct,
+                size,
+                mtime,
+                hash_str,
+            )
+
+        log_event(
+            "JAVA_FOLDER_INDEX:fallback_parse_serial_done",
+            files=len(java_files),
+            ms=int((time.perf_counter() - t_parse) * 1000),
+        )
+
+        try:
+            ok = sum(1 for pf in parsed_by_rel.values() if getattr(pf, "parse_status", None) == "ok")
+            err = len(parsed_by_rel) - ok
+            _diag_print(
+                "fallback_parse_serial_done",
+                ms=int((time.perf_counter() - t_parse) * 1000),
+                parsed=len(parsed_by_rel),
+                ok=ok,
+                err=err,
+            )
+        except Exception:
+            pass
+
+        return parsed_by_rel, file_metadata
+
+    log_event("JAVA_FOLDER_INDEX:fallback_parse_parallel", files=len(java_files), workers=max_workers)
+    t_parse = time.perf_counter()
+    chunks = _chunk_files(java_files, max_workers, target_chunk_size=target_chunk_size)
+
+    try:
+        _diag_print(
+            "fallback_parse_parallel_begin",
+            chunks=len(chunks),
+            workers=max_workers,
+            chunk_size=target_chunk_size,
+            total=len(java_files),
+        )
+    except Exception:
+        pass
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(
+                _parse_files_batch,
+                str(root),
+                chunk,
+                max_bytes,
+                slow_file_ms,
+            ): idx
+            for idx, chunk in enumerate(chunks)
+        }
+
+        completed = 0
+
+        for future in as_completed(futures):
+            batch_idx = futures[future]
+
+            try:
+                batch_results = future.result()
+
+                for rel_file, (
+                    pf,
+                    loc,
+                    sloc,
+                    comment_lines,
+                    blank_lines,
+                    comment_pct,
+                    size,
+                    mtime,
+                    hash_str,
+                ) in batch_results.items():
+                    rel_norm = to_posix(rel_file)
+                    parsed_by_rel[rel_norm] = pf
+                    file_metadata[rel_norm] = (
+                        loc,
+                        sloc,
+                        comment_lines,
+                        blank_lines,
+                        comment_pct,
+                        size,
+                        mtime,
+                        hash_str,
+                    )
+
+                completed += len(batch_results)
+
+                ok_now = sum(
+                    1 for pf in parsed_by_rel.values()
+                    if getattr(pf, "parse_status", None) == "ok"
+                )
+                err_now = len(parsed_by_rel) - ok_now
+                elapsed_ms = int((time.perf_counter() - t_parse) * 1000)
+
+                log_event(
+                    "JAVA_FOLDER_INDEX:fallback_batch_done",
+                    batch=batch_idx,
+                    batch_size=len(chunks[batch_idx]),
+                    completed=completed,
+                    total=len(java_files),
+                    ok=ok_now,
+                    err=err_now,
+                    elapsed_ms=elapsed_ms,
+                )
+
+                try:
+                    _diag_print(
+                        "fallback_batch_done",
+                        batch=batch_idx,
+                        batch_size=len(chunks[batch_idx]),
+                        completed=completed,
+                        total=len(java_files),
+                        ok=ok_now,
+                        err=err_now,
+                        elapsed_ms=elapsed_ms,
+                    )
+                except Exception:
+                    pass
+
+            except Exception as e:
+                elapsed_ms = int((time.perf_counter() - t_parse) * 1000)
+                log_event(
+                    "JAVA_FOLDER_INDEX:fallback_batch_error",
+                    batch=batch_idx,
+                    batch_size=len(chunks[batch_idx]),
+                    completed=completed,
+                    total=len(java_files),
+                    elapsed_ms=elapsed_ms,
+                    error=f"{type(e).__name__}:{str(e)[:300]}",
+                )
+                try:
+                    _diag_print(
+                        "fallback_batch_error",
+                        batch=batch_idx,
+                        batch_size=len(chunks[batch_idx]),
+                        completed=completed,
+                        total=len(java_files),
+                        elapsed_ms=elapsed_ms,
+                        exc_type=type(e).__name__,
+                        exc=str(e)[:300],
+                    )
+                except Exception:
+                    pass
+
+    log_event(
+        "JAVA_FOLDER_INDEX:fallback_parse_parallel_done",
+        files=len(java_files),
+        parsed=len(parsed_by_rel),
+        ms=int((time.perf_counter() - t_parse) * 1000),
+    )
+
+    try:
+        ok = sum(1 for pf in parsed_by_rel.values() if getattr(pf, "parse_status", None) == "ok")
+        err = len(parsed_by_rel) - ok
+        _diag_print(
+            "fallback_parse_parallel_done",
+            ms=int((time.perf_counter() - t_parse) * 1000),
+            parsed=len(parsed_by_rel),
+            ok=ok,
+            err=err,
+            metadata=len(file_metadata),
+        )
+    except Exception:
+        pass
+
+    return parsed_by_rel, file_metadata
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -487,6 +982,7 @@ def build_folder_index(
     log_event("JAVA_FOLDER_INDEX:build_enter", root=str(root))
 
     root = Path(root).resolve()
+    include_tests = bool(getattr(cfg, "include_tests", True))
 
     try:
         _diag_print(
@@ -495,16 +991,21 @@ def build_folder_index(
             cfg_type=type(cfg).__name__,
             has_parsed_cache=bool(parsed_cache),
             parsed_cache_len=(len(parsed_cache) if isinstance(parsed_cache, dict) else None),
-            include_tests=bool(getattr(cfg, "include_tests", True)),
+            include_tests=include_tests,
         )
     except Exception:
         pass
 
     if files is None:
-        java_files = _iter_java_files(root, include_tests=getattr(cfg, "include_tests", True))
+        java_files = _iter_java_files(root, include_tests=include_tests)
         log_event("JAVA_FOLDER_INDEX:iter_files_end", root=str(root), count=len(java_files), mode="full_repo")
         try:
-            _diag_print("iter_files_end", mode="full_repo", count=len(java_files))
+            _diag_print(
+                "iter_files_end",
+                mode="full_repo",
+                count=len(java_files),
+                skipped_tests="filtered" if not include_tests else 0,
+            )
             if java_files:
                 _diag_print("iter_files_sample", first=str(java_files[0]), last=str(java_files[-1]))
         except Exception:
@@ -513,6 +1014,7 @@ def build_folder_index(
         java_files_filtered: List[Path] = []
         skipped_outside = 0
         skipped_non_java = 0
+        skipped_tests = 0
 
         for p in files:
             try:
@@ -529,11 +1031,17 @@ def build_folder_index(
 
             try:
                 ap.relative_to(root)
+
+                if not include_tests and _is_test_java_path(ap, root):
+                    skipped_tests += 1
+                    continue
+
                 java_files_filtered.append(ap)
             except Exception:
                 skipped_outside += 1
 
         java_files = sorted(set(java_files_filtered), key=lambda p: to_posix(str(p)))
+
         log_event(
             "JAVA_FOLDER_INDEX:iter_files_end",
             root=str(root),
@@ -541,7 +1049,9 @@ def build_folder_index(
             mode="bucket",
             skipped_outside=skipped_outside,
             skipped_non_java=skipped_non_java,
+            skipped_tests=skipped_tests,
         )
+
         try:
             _diag_print(
                 "iter_files_end",
@@ -549,6 +1059,7 @@ def build_folder_index(
                 count=len(java_files),
                 skipped_outside=skipped_outside,
                 skipped_non_java=skipped_non_java,
+                skipped_tests=skipped_tests,
             )
             if java_files:
                 _diag_print("iter_files_sample", first=str(java_files[0]), last=str(java_files[-1]))
@@ -556,14 +1067,18 @@ def build_folder_index(
             pass
 
     max_bytes = getattr(cfg, "max_file_bytes", getattr(cfg, "max_bytes_per_file", None))
-    use_jar_imports = getattr(cfg, "java_use_jar_imports", True)
+    use_jar_imports = bool(getattr(cfg, "java_use_jar_imports", True))
+    target_chunk_size = int(getattr(cfg, "java_parse_chunk_size", 25) or 25)
+    slow_file_ms = int(getattr(cfg, "java_slow_file_ms", 5000) or 5000)
 
     try:
         _diag_print(
             "config",
             max_bytes=max_bytes,
-            use_jar_imports=bool(use_jar_imports),
+            use_jar_imports=use_jar_imports,
             cfg_max_workers=getattr(cfg, "max_workers", None),
+            java_parse_chunk_size=target_chunk_size,
+            java_slow_file_ms=slow_file_ms,
         )
     except Exception:
         pass
@@ -588,157 +1103,23 @@ def build_folder_index(
             _diag_print("using_cache_done", parsed=len(parsed_by_rel), metadata=len(file_metadata))
         except Exception:
             pass
+
+    elif use_jar_imports:
+        parsed_by_rel, file_metadata = _build_from_javaparser_batch(
+            root=root,
+            java_files=java_files,
+            max_bytes=max_bytes,
+        )
+
     else:
-        cpu_count = os.cpu_count() or 1
-        max_workers = getattr(cfg, "max_workers", cpu_count)
-        max_workers = min(max(1, max_workers), len(java_files) or 1)
-
-        try:
-            _diag_print("parse_plan", cpu_count=cpu_count, max_workers=max_workers, files=len(java_files))
-        except Exception:
-            pass
-
-        if max_workers <= 1 or len(java_files) < 10:
-            log_event("JAVA_FOLDER_INDEX:parse_serial", files=len(java_files))
-            t_parse = time.perf_counter()
-
-            batch_results = _parse_files_batch(str(root), java_files, max_bytes)
-            for rel_file, (
-                pf,
-                loc,
-                sloc,
-                comment_lines,
-                blank_lines,
-                comment_pct,
-                size,
-                mtime,
-                hash_str,
-            ) in batch_results.items():
-                rel_norm = to_posix(rel_file)
-                parsed_by_rel[rel_norm] = pf
-                file_metadata[rel_norm] = (
-                    loc,
-                    sloc,
-                    comment_lines,
-                    blank_lines,
-                    comment_pct,
-                    size,
-                    mtime,
-                    hash_str,
-                )
-
-            log_event(
-                "JAVA_FOLDER_INDEX:parse_serial_done",
-                files=len(java_files),
-                ms=int((time.perf_counter() - t_parse) * 1000),
-            )
-
-            try:
-                ok = sum(1 for pf in parsed_by_rel.values() if getattr(pf, "parse_status", None) == "ok")
-                err = len(parsed_by_rel) - ok
-                _diag_print(
-                    "parse_serial_done",
-                    ms=int((time.perf_counter() - t_parse) * 1000),
-                    parsed=len(parsed_by_rel),
-                    ok=ok,
-                    err=err,
-                )
-            except Exception:
-                pass
-        else:
-            log_event("JAVA_FOLDER_INDEX:parse_parallel", files=len(java_files), workers=max_workers)
-            t_parse = time.perf_counter()
-            chunks = _chunk_files(java_files, max_workers)
-
-            try:
-                _diag_print("parse_parallel_begin", chunks=len(chunks), workers=max_workers)
-            except Exception:
-                pass
-
-            with ProcessPoolExecutor(max_workers=max_workers) as executor:
-                futures = {
-                    executor.submit(_parse_files_batch, str(root), chunk, max_bytes): idx
-                    for idx, chunk in enumerate(chunks)
-                }
-
-                completed = 0
-                for future in as_completed(futures):
-                    batch_idx = futures[future]
-                    try:
-                        batch_results = future.result()
-                        for rel_file, (
-                            pf,
-                            loc,
-                            sloc,
-                            comment_lines,
-                            blank_lines,
-                            comment_pct,
-                            size,
-                            mtime,
-                            hash_str,
-                        ) in batch_results.items():
-                            rel_norm = to_posix(rel_file)
-                            parsed_by_rel[rel_norm] = pf
-                            file_metadata[rel_norm] = (
-                                loc,
-                                sloc,
-                                comment_lines,
-                                blank_lines,
-                                comment_pct,
-                                size,
-                                mtime,
-                                hash_str,
-                            )
-
-                        completed += len(batch_results)
-                        log_event(
-                            "JAVA_FOLDER_INDEX:batch_done",
-                            batch=batch_idx,
-                            batch_size=len(chunks[batch_idx]),
-                            completed=completed,
-                            total=len(java_files),
-                        )
-                        try:
-                            _diag_print(
-                                "batch_done",
-                                batch=batch_idx,
-                                batch_size=len(chunks[batch_idx]),
-                                completed=completed,
-                                total=len(java_files),
-                            )
-                        except Exception:
-                            pass
-                    except Exception as e:
-                        log_event(
-                            "JAVA_FOLDER_INDEX:batch_error",
-                            batch=batch_idx,
-                            error=f"{type(e).__name__}:{str(e)[:100]}",
-                        )
-                        try:
-                            _diag_print("batch_error", batch=batch_idx, exc_type=type(e).__name__, exc=str(e)[:300])
-                        except Exception:
-                            pass
-
-            log_event(
-                "JAVA_FOLDER_INDEX:parse_parallel_done",
-                files=len(java_files),
-                parsed=len(parsed_by_rel),
-                ms=int((time.perf_counter() - t_parse) * 1000),
-            )
-
-            try:
-                ok = sum(1 for pf in parsed_by_rel.values() if getattr(pf, "parse_status", None) == "ok")
-                err = len(parsed_by_rel) - ok
-                _diag_print(
-                    "parse_parallel_done",
-                    ms=int((time.perf_counter() - t_parse) * 1000),
-                    parsed=len(parsed_by_rel),
-                    ok=ok,
-                    err=err,
-                    metadata=len(file_metadata),
-                )
-            except Exception:
-                pass
+        parsed_by_rel, file_metadata = _build_from_fallback_per_file(
+            root=root,
+            java_files=java_files,
+            cfg=cfg,
+            max_bytes=max_bytes,
+            target_chunk_size=target_chunk_size,
+            slow_file_ms=slow_file_ms,
+        )
 
     files_map: Dict[str, FileEntry] = {}
     parse_issues: List[str] = []
@@ -828,7 +1209,7 @@ def build_folder_index(
             hash=hash_int,
             import_style_counts={},
             symbol_internal=tuple(),
-            imports_external=tuple(),  # computed after resolution
+            imports_external=tuple(),
             language_facts={
                 "java": {
                     "package": getattr(pf, "package", None),
@@ -845,7 +1226,12 @@ def build_folder_index(
 
     try:
         with_imports = sum(1 for fe in files_map.values() if fe.imports_all and len(fe.imports_all) > 0)
-        _diag_print("file_entries_built", entries=len(files_map), with_imports=with_imports, parse_issues=len(parse_issues))
+        _diag_print(
+            "file_entries_built",
+            entries=len(files_map),
+            with_imports=with_imports,
+            parse_issues=len(parse_issues),
+        )
     except Exception:
         pass
 
@@ -949,8 +1335,6 @@ def build_folder_index(
         third_party_total += len(third_party_specs_t)
         internal_unresolved_total += len(internal_unresolved_specs_t)
 
-        # v1.9: unresolved specs belong here, not in imports_all.
-        # imports_all should remain the raw Java import surface from the parser.
         imports_external = tuple(
             sorted(set(stdlib_specs_t + third_party_specs_t + internal_unresolved_specs_t))
         )
@@ -965,7 +1349,6 @@ def build_folder_index(
             "symbol_internal": 0,
         }
 
-        # Optional richer Java details under the language-neutral extension field.
         language_facts = dict(getattr(fe, "language_facts", {}) or {})
         java_facts = dict(language_facts.get("java", {}) or {})
         java_facts.update({

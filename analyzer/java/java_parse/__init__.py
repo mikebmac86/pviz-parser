@@ -4,6 +4,7 @@ from __future__ import annotations
 from .models import JavaParsedFile, JavaImport
 from .engine import (
     parse_java_file,
+    parse_java_files,
     extract_package,
     extract_declared_types,
     extract_imports,
@@ -11,6 +12,7 @@ from .engine import (
 
 __all__ = [
     "JavaParsedFile",
+    "parse_java_files",
     "JavaImport",
     "parse_java_file",
     "extract_package",
