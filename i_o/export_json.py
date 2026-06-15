@@ -232,7 +232,7 @@ def serialize_graph_to_json_dict(graph: GraphLike | Mapping[str, Any]) -> GraphJ
     # Common metadata: provenance.
     meta: Dict[str, Any] = {
         "tool": "pviz-parser",
-        "build": "0.2.0",
+        "build": "0.2.1",
         "license": "MIT",
     }
 
